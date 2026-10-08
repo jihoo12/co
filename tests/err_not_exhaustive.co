@@ -1,0 +1,9 @@
+// error: switch on 'Shape' does not handle: Rect, Empty
+type Shape enum { Circle(float), Rect(float, float), Empty }
+func f(s Shape) int {
+    switch s {
+    case Circle(r): return 1
+    }
+    return 0
+}
+func main() {}

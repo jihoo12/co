@@ -120,6 +120,9 @@ private:
       if (s.rv.kind == Rvalue::Ref) {
         indexReads(s.rv.place, s.loc, out);
         out.push_back({s.rv.mut ? Access::MutBorrow : Access::SharedBorrow, s.rv.place, s.loc});
+      } else if (s.rv.kind == Rvalue::Discriminant) {
+        indexReads(s.rv.place, s.loc, out);
+        out.push_back({Access::Read, s.rv.place, s.loc});
       }
       indexReads(s.place, s.loc, out);
       out.push_back({s.place.isLocal() ? Access::ShallowWrite : Access::Write, s.place, s.loc});
@@ -149,6 +152,15 @@ private:
 
   bool nonVoidReturn() const { return f_.info->ret->kind != TypeKind::Void; }
 
+  // Moving out of a place consumes its whole local when the place is the
+  // local itself or (for `opt or x`) the payload of an enum held in it.
+  static bool consumesLocal(const Place &p) {
+    for (auto &pr : p.proj)
+      if (pr.kind != Proj::VariantField)
+        return false;
+    return true;
+  }
+
   std::string name(const Place &p) const { return f_.placeName(p); }
 
   // ----- 1. initialization / move analysis -----
@@ -161,7 +173,7 @@ private:
     for (int p = 1; p <= f_.numParams; p++)
       entry[0].reset(p);
     reached[0] = true;
-    std::unordered_map<int, SourceLoc> movedAt;
+    std::unordered_map<int, Note> movedAt;
     std::set<int> reported;
 
     auto transfer = [&](int b, BitSet st, bool report) {
@@ -178,7 +190,7 @@ private:
         std::vector<Note> notes;
         auto mv = movedAt.find(a.place.local);
         if (mv != movedAt.end())
-          notes.push_back({mv->second, "value moved here"});
+          notes.push_back(mv->second);
         std::string vname = l.name.empty() ? "temporary" : l.name;
         std::string msg;
         bool viaRef = !a.place.proj.empty() && a.place.proj[0].kind == Proj::Deref;
@@ -209,10 +221,10 @@ private:
           }
         }
         for (auto &a : acc) {
-          if (a.kind == Access::Move && a.place.isLocal()) {
+          if (a.kind == Access::Move && consumesLocal(a.place)) {
             st.set(a.place.local);
             if (report)
-              movedAt[a.place.local] = a.loc;
+              movedAt[a.place.local] = {a.loc, s.moveNote.empty() ? "value moved here" : s.moveNote};
           } else if (a.kind == Access::Drop || a.kind == Access::StorageDead) {
             st.set(a.place.local);
           }
@@ -320,7 +332,7 @@ private:
     size_t nl = f_.locals.size();
     localRegion_.assign(nl, -1);
     for (size_t l = 0; l < nl; l++) {
-      if (!f_.locals[l].type->isRef())
+      if (!f_.locals[l].type->containsRef())
         continue;
       int r = newRegion();
       localRegion_[l] = r;
@@ -343,20 +355,20 @@ private:
           Loan loan{rv.place, rv.mut, p, s.loc, newRegion()};
           if (destRegion >= 0)
             outlives_.push_back({loan.region, destRegion});
-          // Reborrowing through `*r` must not outlive `r` itself.
-          if (!rv.place.proj.empty() && rv.place.proj[0].kind == Proj::Deref) {
-            int rr = localRegion_[rv.place.local];
-            if (rr >= 0)
-              outlives_.push_back({rr, loan.region});
-          }
+          // A borrow must not outlive references held by what it borrows:
+          // reborrowing through `*r` can't outlive `r`, and borrowing an
+          // optional reference can't outlive the reference inside it.
+          int rr = localRegion_[rv.place.local];
+          if (rr >= 0)
+            outlives_.push_back({rr, loan.region});
           loanAt_[p] = (int)loans_.size();
           loans_.push_back(loan);
         } else if (destRegion >= 0) {
           // Data flowing into a reference: the source must outlive the destination.
           for (auto &op : rv.ops) {
-            if (op.kind == Operand::Const || !op.type->isRef())
+            if (op.kind == Operand::Const || !op.type->containsRef())
               continue;
-            int sr = op.place.isLocal() ? localRegion_[op.place.local] : -1;
+            int sr = localRegion_[op.place.local];
             if (sr >= 0)
               outlives_.push_back({sr, destRegion});
           }
@@ -385,6 +397,9 @@ private:
       const Proj &x = a.proj[i], &y = b.proj[i];
       if (x.kind == Proj::Field && y.kind == Proj::Field && x.field != y.field)
         return false; // disjoint fields
+      if (x.kind == Proj::VariantField && y.kind == Proj::VariantField && x.variant == y.variant &&
+          x.field != y.field)
+        return false;
     }
     return true;
   }

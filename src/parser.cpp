@@ -16,7 +16,7 @@ public:
         if (accept(Tok::Semi))
           continue;
         if (at(Tok::KwType))
-          prog->structs.push_back(parseStructDecl());
+          parseTypeDecl(*prog);
         else if (at(Tok::KwFunc))
           prog->funcs.push_back(parseFuncDecl());
         else
@@ -108,6 +108,11 @@ private:
       t->inner = parseType();
       return t;
     }
+    if (accept(Tok::Question)) {
+      t->kind = TypeExpr::Optional;
+      t->inner = parseType();
+      return t;
+    }
     if (accept(Tok::LBracket)) {
       expect(Tok::RBracket, "in slice type");
       t->kind = TypeExpr::Slice;
@@ -122,16 +127,79 @@ private:
     fail("expected a type, found " + describe(cur()));
   }
 
-  bool atTypeStart() const { return at(Tok::Amp) || at(Tok::AndAnd) || at(Tok::LBracket) || at(Tok::Ident); }
-
   // ----- declarations -----
 
-  std::unique_ptr<StructDecl> parseStructDecl() {
+  void parseTypeDecl(Program &prog) {
     expect(Tok::KwType);
+    SourceLoc l = loc();
+    std::string name = expect(Tok::Ident, "after 'type'").text;
+    if (at(Tok::KwEnum)) {
+      prog.enums.push_back(parseEnumBody(l, name));
+      return;
+    }
+    if (!at(Tok::KwStruct))
+      fail("expected 'struct' or 'enum' after the type name");
+    prog.structs.push_back(parseStructBody(l, name));
+  }
+
+  std::unique_ptr<EnumDecl> parseEnumBody(SourceLoc l, const std::string &name) {
+    expect(Tok::KwEnum);
+    auto ed = std::make_unique<EnumDecl>();
+    ed->loc = l;
+    ed->name = name;
+    expect(Tok::LBrace);
+    skipSemis();
+    while (!at(Tok::RBrace)) {
+      EnumVariantDecl v;
+      v.loc = loc();
+      v.name = expect(Tok::Ident, "for variant name").text;
+      if (accept(Tok::LParen)) {
+        v.fields = parseVariantFields();
+        expect(Tok::RParen, "after variant fields");
+      }
+      ed->variants.push_back(std::move(v));
+      if (!at(Tok::RBrace) && !accept(Tok::Comma))
+        expect(Tok::Semi, "after enum variant");
+      skipSemis();
+    }
+    expect(Tok::RBrace);
+    return ed;
+  }
+
+  // Variant payloads may be written as types `(float, int)` or with names
+  // for documentation `(w, h float)`; only the types matter.
+  std::vector<TypeExprPtr> parseVariantFields() {
+    std::vector<TypeExprPtr> out;
+    std::vector<TypeExprPtr> pending; // bare identifiers: names or types
+    while (!at(Tok::RParen)) {
+      if (at(Tok::Ident) && peekTok(1).kind != Tok::Comma && peekTok(1).kind != Tok::RParen) {
+        next(); // a field name
+        auto ty = parseType();
+        for (size_t i = 0; i < pending.size(); i++)
+          out.push_back(cloneType(*ty));
+        pending.clear();
+        out.push_back(std::move(ty));
+      } else if (at(Tok::Ident)) {
+        pending.push_back(parseType());
+      } else {
+        for (auto &p : pending)
+          out.push_back(std::move(p));
+        pending.clear();
+        out.push_back(parseType());
+      }
+      if (!accept(Tok::Comma))
+        break;
+    }
+    for (auto &p : pending)
+      out.push_back(std::move(p));
+    return out;
+  }
+
+  std::unique_ptr<StructDecl> parseStructBody(SourceLoc l, const std::string &name) {
     auto sd = std::make_unique<StructDecl>();
-    sd->loc = loc();
-    sd->name = expect(Tok::Ident, "after 'type'").text;
-    expect(Tok::KwStruct, "(only struct types can be declared)");
+    sd->loc = l;
+    sd->name = name;
+    expect(Tok::KwStruct);
     expect(Tok::LBrace);
     skipSemis();
     while (!at(Tok::RBrace)) {
@@ -285,6 +353,8 @@ private:
       return parseIf();
     case Tok::KwFor:
       return parseFor();
+    case Tok::KwSwitch:
+      return parseSwitch();
     case Tok::LBrace:
       return parseBlock();
     default:
@@ -342,6 +412,41 @@ private:
     return s;
   }
 
+  StmtPtr parseSwitch() {
+    auto sw = std::make_unique<SwitchStmt>(loc());
+    expect(Tok::KwSwitch);
+    if (!at(Tok::LBrace)) {
+      noStructLit_ = true;
+      sw->tag = parseExpr();
+      noStructLit_ = false;
+    }
+    expect(Tok::LBrace, "to start switch body");
+    skipSemis();
+    while (!at(Tok::RBrace) && !at(Tok::Eof)) {
+      SwitchCase c;
+      c.loc = loc();
+      if (accept(Tok::KwDefault)) {
+        c.isDefault = true;
+      } else {
+        expect(Tok::KwCase, "in switch (each branch starts with 'case' or 'default')");
+        do {
+          c.values.push_back(parseExpr());
+        } while (accept(Tok::Comma));
+      }
+      expect(Tok::Colon, "after case");
+      skipSemis();
+      while (!at(Tok::KwCase) && !at(Tok::KwDefault) && !at(Tok::RBrace) && !at(Tok::Eof)) {
+        c.body.push_back(parseStmt());
+        if (!at(Tok::KwCase) && !at(Tok::KwDefault) && !at(Tok::RBrace))
+          expect(Tok::Semi, "after statement");
+        skipSemis();
+      }
+      sw->cases.push_back(std::move(c));
+    }
+    expect(Tok::RBrace, "to end switch");
+    return sw;
+  }
+
   StmtPtr parseFor() {
     SourceLoc l = loc();
     expect(Tok::KwFor);
@@ -350,10 +455,17 @@ private:
       f->body = parseBlock();
       return f;
     }
-    if (at(Tok::Ident) && peekTok(1).kind == Tok::Define && peekTok(2).kind == Tok::KwRange) {
+    bool twoVars = at(Tok::Ident) && peekTok(1).kind == Tok::Comma && peekTok(2).kind == Tok::Ident &&
+                   peekTok(3).kind == Tok::Define && peekTok(4).kind == Tok::KwRange;
+    if (twoVars || (at(Tok::Ident) && peekTok(1).kind == Tok::Define && peekTok(2).kind == Tok::KwRange)) {
       auto f = std::make_unique<ForRangeStmt>(l);
       f->nameLoc = loc();
       f->name = next().text;
+      if (twoVars) {
+        next();
+        f->valueLoc = loc();
+        f->valueName = next().text;
+      }
       next();
       next();
       noStructLit_ = true;
@@ -390,16 +502,18 @@ private:
 
   static int precedence(Tok t) {
     switch (t) {
-    case Tok::OrOr: return 1;
-    case Tok::AndAnd: return 2;
-    case Tok::Eq: case Tok::Ne: case Tok::Lt: case Tok::Le: case Tok::Gt: case Tok::Ge: return 3;
-    case Tok::Plus: case Tok::Minus: return 4;
-    case Tok::Star: case Tok::Slash: case Tok::Percent: return 5;
+    case Tok::KwOr: return 1;
+    case Tok::OrOr: return 2;
+    case Tok::AndAnd: return 3;
+    case Tok::Eq: case Tok::Ne: case Tok::Lt: case Tok::Le: case Tok::Gt: case Tok::Ge: return 4;
+    case Tok::Plus: case Tok::Minus: return 5;
+    case Tok::Star: case Tok::Slash: case Tok::Percent: return 6;
     default: return 0;
     }
   }
   static BinOp binOpFor(Tok t) {
     switch (t) {
+    case Tok::KwOr: return BinOp::OrElse;
     case Tok::OrOr: return BinOp::Or;
     case Tok::AndAnd: return BinOp::And;
     case Tok::Eq: return BinOp::Eq;
@@ -503,6 +617,9 @@ private:
     case Tok::KwFalse:
       next();
       return std::make_unique<BoolLitExpr>(l, false);
+    case Tok::KwNone:
+      next();
+      return std::make_unique<NoneLitExpr>(l);
     case Tok::LParen: {
       next();
       bool saved = noStructLit_;

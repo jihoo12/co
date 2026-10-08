@@ -56,6 +56,7 @@ void co_print_int(int64_t v) { printf("%" PRId64, v); }
 void co_print_float(double v) { printf("%g", v); }
 void co_print_bool(int32_t v) { fputs(v ? "true" : "false", stdout); }
 void co_print_str(const CoVec *s) { fwrite(s->ptr, 1, (size_t)s->len, stdout); }
+void co_print_cstr(const char *s) { fputs(s, stdout); }
 void co_print_space(void) { putchar(' '); }
 void co_print_newline(void) { putchar('\n'); }
 

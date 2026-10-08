@@ -1,0 +1,7 @@
+// error: 'Empty' is a variant of several enums; write 'EnumName.Empty'
+type A enum { Empty, Full }
+type B enum { Empty, Half }
+func main() {
+    x := Empty
+    y := A.Empty
+}

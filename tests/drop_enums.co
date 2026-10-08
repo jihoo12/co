@@ -1,0 +1,21 @@
+// expect: 100
+type Msg enum { Text(body string, tags []string), Ping, Many(items []Msg) }
+func make(i int) Msg {
+    if i % 3 == 0 { return Ping }
+    if i % 3 == 1 { return Text("m" + str(i), []string{"a", "b"}) }
+    return Many([]Msg{Text("inner", []string{}), Ping})
+}
+func main() {
+    var keep ?Msg
+    count := 0
+    for i := range 100 {
+        m := make(i)
+        c := clone(m)
+        keep = c                       // replaces (and frees) the previous value
+        switch m {
+        case Text(body, _): count += len(body) - len(body) + 1
+        default: count++
+        }
+    }
+    println(count)
+}

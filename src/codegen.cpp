@@ -54,7 +54,8 @@ private:
   llvm::StructType *vecTy_;
   std::unordered_map<StructInfo *, llvm::StructType *> structTys_;
   std::unordered_map<FuncInfo *, llvm::Function *> fns_;
-  std::unordered_map<Type *, llvm::Function *> dropFns_, cloneFns_;
+  std::unordered_map<Type *, llvm::Function *> dropFns_, cloneFns_, printFns_;
+  std::unordered_map<EnumInfo *, llvm::StructType *> enumTys_;
 
   // per-function state
   const Function *f_ = nullptr;
@@ -75,6 +76,20 @@ private:
     case TypeKind::String:
     case TypeKind::Slice: return vecTy_;
     case TypeKind::Ref: return ptrTy_;
+    case TypeKind::None: return i64_;
+    case TypeKind::Enum: {
+      // { i64 tag, [N x i64] payload } where the payload fits the largest variant.
+      auto it = enumTys_.find(t->en);
+      if (it != enumTys_.end())
+        return it->second;
+      auto *st = llvm::StructType::create(ctx_, "co." + t->en->name);
+      enumTys_[t->en] = st;
+      uint64_t size = 0;
+      for (size_t v = 0; v < t->en->variants.size(); v++)
+        size = std::max<uint64_t>(size, dl_.getTypeAllocSize(variantTy(t, (int)v)));
+      st->setBody({i64_, llvm::ArrayType::get(i64_, (size + 7) / 8)});
+      return st;
+    }
     case TypeKind::Struct: {
       auto it = structTys_.find(t->st);
       if (it != structTys_.end())
@@ -89,6 +104,13 @@ private:
     }
     }
     return void_;
+  }
+
+  llvm::StructType *variantTy(Type *t, int v) {
+    std::vector<llvm::Type *> fields;
+    for (Type *f : t->en->variants[v].fields)
+      fields.push_back(lt(f));
+    return llvm::StructType::get(ctx_, fields);
   }
 
   llvm::Value *sizeOf(Type *t) { return llvm::ConstantInt::get(i64_, dl_.getTypeAllocSize(lt(t))); }
@@ -173,6 +195,108 @@ private:
       }
       break;
     }
+    case TypeKind::Enum:
+      forEachVariant(ib, t, p, [&](int v, llvm::Value *payload) {
+        auto *vt = variantTy(t, v);
+        auto &fields = t->en->variants[v].fields;
+        for (size_t i = 0; i < fields.size(); i++)
+          if (fields[i]->needsDrop())
+            ib.CreateCall(dropFn(fields[i]), {ib.CreateStructGEP(vt, payload, (unsigned)i)});
+      });
+      break;
+    default:
+      break;
+    }
+    ib.CreateRetVoid();
+    return fn;
+  }
+
+  // Emits a switch on the enum tag at `p`, calling body(variant, payloadPtr)
+  // in each arm; continues after the switch.
+  void forEachVariant(llvm::IRBuilder<> &ib, Type *t, llvm::Value *p,
+                      const std::function<void(int, llvm::Value *)> &body) {
+    llvm::Function *fn = ib.GetInsertBlock()->getParent();
+    llvm::Type *et = lt(t);
+    llvm::Value *tag = ib.CreateLoad(i64_, ib.CreateStructGEP(et, p, 0));
+    llvm::Value *payload = ib.CreateStructGEP(et, p, 1);
+    auto *done = llvm::BasicBlock::Create(ctx_, "variant.done", fn);
+    auto *sw = ib.CreateSwitch(tag, done, (unsigned)t->en->variants.size());
+    for (size_t v = 0; v < t->en->variants.size(); v++) {
+      auto *bb = llvm::BasicBlock::Create(ctx_, "variant." + t->en->variants[v].name, fn);
+      sw->addCase(llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(i64_), v), bb);
+      ib.SetInsertPoint(bb);
+      body((int)v, payload);
+      ib.CreateBr(done);
+    }
+    ib.SetInsertPoint(done);
+  }
+
+  // Prints any value, given a pointer to it.
+  llvm::Function *printFn(Type *t) {
+    auto it = printFns_.find(t);
+    if (it != printFns_.end())
+      return it->second;
+    auto *fty = llvm::FunctionType::get(void_, {ptrTy_}, false);
+    auto *fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage, "co.print." + t->str(), mod_);
+    printFns_[t] = fn;
+    llvm::IRBuilder<> ib(llvm::BasicBlock::Create(ctx_, "entry", fn));
+    llvm::Value *p = fn->getArg(0);
+    auto text = [&](const std::string &s) {
+      ib.CreateCall(rt("co_print_cstr", void_, {ptrTy_}), {ib.CreateGlobalString(s)});
+    };
+    switch (t->kind) {
+    case TypeKind::Int: ib.CreateCall(rt("co_print_int", void_, {i64_}), {ib.CreateLoad(i64_, p)}); break;
+    case TypeKind::Float: ib.CreateCall(rt("co_print_float", void_, {f64_}), {ib.CreateLoad(f64_, p)}); break;
+    case TypeKind::Bool:
+      ib.CreateCall(rt("co_print_bool", void_, {i32_}), {ib.CreateZExt(ib.CreateLoad(i1_, p), i32_)});
+      break;
+    case TypeKind::String: ib.CreateCall(rt("co_print_str", void_, {ptrTy_}), {p}); break;
+    case TypeKind::Ref: ib.CreateCall(printFn(t->inner), {ib.CreateLoad(ptrTy_, p)}); break;
+    case TypeKind::Slice: {
+      text("[");
+      llvm::Value *data = ib.CreateLoad(ptrTy_, ib.CreateStructGEP(vecTy_, p, 0));
+      llvm::Value *len = ib.CreateLoad(i64_, ib.CreateStructGEP(vecTy_, p, 1));
+      llvm::Function *ep = printFn(t->inner);
+      llvm::Type *et = lt(t->inner);
+      emitLoop(ib, len, [&](llvm::Value *i) {
+        auto *sep = llvm::BasicBlock::Create(ctx_, "sep", fn);
+        auto *elem = llvm::BasicBlock::Create(ctx_, "elem", fn);
+        ib.CreateCondBr(ib.CreateICmpNE(i, llvm::ConstantInt::get(i64_, 0)), sep, elem);
+        ib.SetInsertPoint(sep);
+        text(", ");
+        ib.CreateBr(elem);
+        ib.SetInsertPoint(elem);
+        ib.CreateCall(ep, {ib.CreateGEP(et, data, i)});
+      });
+      text("]");
+      break;
+    }
+    case TypeKind::Struct: {
+      auto *st = lt(t);
+      text(t->st->name + "{");
+      for (size_t i = 0; i < t->st->fields.size(); i++) {
+        text((i ? ", " : "") + t->st->fields[i].name + ": ");
+        ib.CreateCall(printFn(t->st->fields[i].type), {ib.CreateStructGEP(st, p, (unsigned)i)});
+      }
+      text("}");
+      break;
+    }
+    case TypeKind::Enum:
+      forEachVariant(ib, t, p, [&](int v, llvm::Value *payload) {
+        auto &var = t->en->variants[v];
+        text(var.name);
+        if (var.fields.empty())
+          return;
+        auto *vt = variantTy(t, v);
+        text("(");
+        for (size_t i = 0; i < var.fields.size(); i++) {
+          if (i)
+            text(", ");
+          ib.CreateCall(printFn(var.fields[i]), {ib.CreateStructGEP(vt, payload, (unsigned)i)});
+        }
+        text(")");
+      });
+      break;
     default:
       break;
     }
@@ -205,6 +329,18 @@ private:
           ib.CreateCall(ec, {ib.CreateGEP(et, dd, i), ib.CreateGEP(et, sd, i)});
         });
       }
+    } else if (t->kind == TypeKind::Enum) {
+      // Copy the bits (tag and copyable fields), then deep-clone owned fields.
+      ib.CreateStore(ib.CreateLoad(lt(t), src), dst);
+      llvm::Value *dpay = ib.CreateStructGEP(lt(t), dst, 1);
+      forEachVariant(ib, t, src, [&](int v, llvm::Value *spay) {
+        auto *vt = variantTy(t, v);
+        auto &fields = t->en->variants[v].fields;
+        for (size_t i = 0; i < fields.size(); i++)
+          if (!fields[i]->isCopy())
+            ib.CreateCall(cloneFn(fields[i]),
+                          {ib.CreateStructGEP(vt, dpay, (unsigned)i), ib.CreateStructGEP(vt, spay, (unsigned)i)});
+      });
     } else if (t->kind == TypeKind::Struct) {
       auto *st = lt(t);
       for (size_t i = 0; i < t->st->fields.size(); i++) {
@@ -294,6 +430,12 @@ private:
         v = b_.CreateGEP(lt(ty), data, idx);
         break;
       }
+      case Proj::VariantField: {
+        llvm::Value *payload = b_.CreateStructGEP(lt(ty), v, 1);
+        v = b_.CreateStructGEP(variantTy(ty, pr.variant), payload, (unsigned)pr.field);
+        ty = ty->en->variants[pr.variant].fields[pr.field];
+        break;
+      }
       }
     }
     return v;
@@ -314,7 +456,10 @@ private:
       Type *ty;
       llvm::Value *a = addr(o.place, ty);
       llvm::Value *v = b_.CreateLoad(lt(ty), a);
-      if (o.kind == Operand::Move && o.place.isLocal() && flags_[o.place.local])
+      bool consumes = true; // moving the local itself, or an enum payload out of it
+      for (auto &pr : o.place.proj)
+        consumes &= pr.kind == Proj::VariantField;
+      if (o.kind == Operand::Move && consumes && flags_[o.place.local])
         b_.CreateStore(b_.getFalse(), flags_[o.place.local]);
       return v;
     }
@@ -371,12 +516,8 @@ private:
 
   void printValue(Type *t, llvm::Value *v) {
     if (t->isRef()) {
-      if (t->inner->kind == TypeKind::String) {
-        b_.CreateCall(rt("co_print_str", void_, {ptrTy_}), {v});
-        return;
-      }
-      t = t->inner;
-      v = b_.CreateLoad(lt(t), v);
+      b_.CreateCall(printFn(t->inner), {v});
+      return;
     }
     switch (t->kind) {
     case TypeKind::Int: b_.CreateCall(rt("co_print_int", void_, {i64_}), {v}); break;
@@ -405,7 +546,26 @@ private:
       Type *ty;
       return addr(rv.place, ty);
     }
+    case Rvalue::Discriminant: {
+      Type *ty;
+      llvm::Value *a = addr(rv.place, ty);
+      return b_.CreateLoad(i64_, b_.CreateStructGEP(lt(ty), a, 0));
+    }
     case Rvalue::Aggregate: {
+      if (rv.variant >= 0) {
+        llvm::Type *et = lt(rv.type);
+        std::vector<llvm::Value *> vals;
+        for (auto &op : rv.ops)
+          vals.push_back(operand(op));
+        llvm::Value *tmp = entryAlloca(et);
+        b_.CreateStore(llvm::Constant::getNullValue(et), tmp);
+        b_.CreateStore(llvm::ConstantInt::get(i64_, rv.variant), b_.CreateStructGEP(et, tmp, 0));
+        auto *vt = variantTy(rv.type, rv.variant);
+        llvm::Value *payload = b_.CreateStructGEP(et, tmp, 1);
+        for (size_t i = 0; i < vals.size(); i++)
+          b_.CreateStore(vals[i], b_.CreateStructGEP(vt, payload, (unsigned)i));
+        return b_.CreateLoad(et, tmp);
+      }
       llvm::Value *agg = llvm::UndefValue::get(lt(rv.type));
       for (size_t i = 0; i < rv.ops.size(); i++)
         agg = b_.CreateInsertValue(agg, operand(rv.ops[i]), {(unsigned)i});

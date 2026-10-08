@@ -1,0 +1,11 @@
+// expect: tmp
+// expect: anon
+// `x := ...` keeps borrowed temporaries alive for the whole block.
+func id(s &string) &string { return s }
+func main() {
+    var r &string = id(&"tmp")
+    var nick ?string
+    name := nick or "anon"
+    println(r)
+    println(name)
+}

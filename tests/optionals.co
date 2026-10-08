@@ -1,0 +1,31 @@
+// expect: 2 -1
+// expect: none some(5) 5
+// expect: guest guest
+// expect: ann
+// expect: found ann
+type User struct { name string; nick ?string }
+func indexOf(v &[]int, x int) ?int {
+    for i, y := range v {
+        if y == x { return i }
+    }
+    return none
+}
+func lookup(id int) ?string {
+    if id == 1 { return "ann" }
+    return none
+}
+func takes(s string) { println(s) }
+func main() {
+    v := []int{5, 6, 7}
+    println(indexOf(v, 7) or -1, indexOf(v, 9) or -1)
+    var o ?int
+    println(o, some(5), some(5) or 0)
+    u := User{name: "x"}
+    n := u.nick or "guest"          // borrows: u.nick is not consumed
+    println(n, u.nick or "guest")
+    takes(lookup(1) or "nobody")    // a fresh value comes out owned
+    switch lookup(1) {
+    case some(name): println("found", name)
+    case none: println("nobody")
+    }
+}

@@ -1,0 +1,36 @@
+// expect: one two-or-three other
+// expect: hello!
+// expect: B
+// expect: 0 1 3
+func name(n int) string {
+    switch n {
+    case 1: return "one"
+    case 2, 3: return "two-or-three"
+    default: return "other"
+    }
+}
+func main() {
+    println(name(1), name(3), name(9))
+    s := "hi"
+    switch s {
+    case "hi": println("hello!")
+    case "bye": println("goodbye")
+    }
+    score := 85
+    switch {
+    case score >= 90: println("A")
+    case score >= 80: println("B")
+    default: println("C")
+    }
+    out := ""
+    for i := range 5 {
+        switch i {
+        case 2: continue        // continues the loop
+        case 4: break           // leaves the switch, like Go
+        }
+        if i == 4 { break }
+        if out != "" { out += " " }
+        out += str(i)
+    }
+    println(out)
+}

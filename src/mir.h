@@ -16,9 +16,12 @@ struct Local {
 };
 
 struct Proj {
-  enum Kind { Deref, Field, Index } kind;
-  int field = -1;      // Field
+  // VariantField: field `field` of variant `variant` of an enum (the
+  // variant must be the active one).
+  enum Kind { Deref, Field, Index, VariantField } kind;
+  int field = -1;      // Field, VariantField
   int indexLocal = -1; // Index: local holding the index
+  int variant = -1;    // VariantField
 };
 
 struct Place {
@@ -64,11 +67,13 @@ enum class BuiltinOp {
 };
 
 struct Rvalue {
-  enum Kind { Use, BinaryOp, UnaryOp, Ref, Aggregate, SliceLit, Call, Builtin } kind = Use;
+  // Discriminant reads the active variant index of an enum place.
+  enum Kind { Use, BinaryOp, UnaryOp, Ref, Discriminant, Aggregate, SliceLit, Call, Builtin } kind = Use;
   BinOp bop = BinOp::Add;
   UnOp uop = UnOp::Neg;
   bool mut = false;  // Ref
-  Place place;       // Ref
+  Place place;       // Ref, Discriminant
+  int variant = -1;  // Aggregate of an enum variant
   std::vector<Operand> ops;
   FuncInfo *func = nullptr; // Call
   BuiltinOp builtin = BuiltinOp::Print;
@@ -83,6 +88,7 @@ struct Statement {
   Rvalue rv;
   int local = -1; // StorageDead
   SourceLoc loc;
+  std::string moveNote; // explains a move into a function argument
 };
 
 struct Terminator {

@@ -49,27 +49,27 @@ func main() {
     bob := Person{name: "Bob", age: 42}
     bob.addTag("admin")
     bob.addTag("ops")
-    println(greet(&bob), "tags:", len(bob.tags))
-    for i := range len(bob.tags) {
-        println(" -", bob.tags[i])
+    println(greet(bob), "tags:", len(bob.tags))
+    for _, tag := range bob.tags {
+        println(" -", tag)
     }
 
     a := "hello"
     b := "hi"
-    println("longest:", longest(&a, &b))
+    println("longest:", longest(a, b))   // a and b are lent, not given away
 
     nums := []int{}
     for i := 0; i < 10; i++ {
         nums = append(nums, fib(i))
     }
     sum := 0
-    for i := range len(nums) {
-        sum += nums[i]
+    for _, n := range nums {
+        sum += n
     }
     println("sum of fibs:", sum)
 
     moved := bob          // ownership moves to `moved`
     println(moved.name)
-    copy := clone(&moved) // explicit deep copy
-    println(copy.name, copy.age, 1.5 * 2.0, true)
+    copy := clone(moved)  // explicit deep copy
+    println(copy)
 }

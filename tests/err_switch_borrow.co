@@ -1,0 +1,11 @@
+// error: cannot assign to 's' because it is borrowed
+type Shape enum { Label(text string), Empty }
+func main() {
+    s := Label("x")
+    switch s {
+    case Label(t):
+        s = Empty          // t still points into s
+        println(t)
+    case Empty:
+    }
+}

@@ -1,0 +1,7 @@
+// error: cannot borrow 'v' as mutable because it is also borrowed as immutable
+func main() {
+    v := []int{1, 2}
+    for _, x := range v {
+        v = append(v, x)      // would invalidate the loop
+    }
+}

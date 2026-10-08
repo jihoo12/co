@@ -1,0 +1,11 @@
+// error: cannot borrow 'v' as mutable because it is also borrowed as immutable
+func first(v &[]string) ?&string {
+    if len(v) == 0 { return none }
+    return &v[0]
+}
+func main() {
+    v := []string{"a"}
+    f := first(v)
+    v = append(v, "b")
+    println(f)
+}

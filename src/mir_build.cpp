@@ -65,8 +65,10 @@ private:
   struct Loop {
     int breakBB, continueBB;
     size_t scopeDepth;
+    bool isSwitch = false; // `break` leaves a switch; `continue` skips it
   };
   std::vector<Loop> loops_;
+  int extendScope_ = -1; // while lowering `x := ...`, `&temporary` lives as long as x's block
 
   // ----- construction helpers -----
 
@@ -241,12 +243,14 @@ private:
 
   // Like lowerOperand, but reads of places happen *now* (into a temp), so
   // evaluation order of call arguments matches the source.
-  Operand lowerArg(const Expr *e) {
+  Operand lowerArg(const Expr *e, const std::string &moveNote = "") {
     Operand o = lowerOperand(e);
     if (o.kind == Operand::Const || (o.place.isLocal() && f_.locals[o.place.local].name.empty()))
       return o;
     int t = newTemp(e->type, e->loc);
     assign(Place{t, {}}, use(o), e->loc);
+    if (o.kind == Operand::Move && o.place.isLocal())
+      f_.blocks[cur_].stmts.back().moveNote = moveNote;
     Operand r;
     r.kind = e->type->isCopy() ? Operand::Copy : Operand::Move;
     r.place.local = t;
@@ -295,9 +299,111 @@ private:
     }
   }
 
+  // The enum place an expression refers to, looking through one reference.
+  Place enumPlace(const Expr *e) {
+    Place p = placeOrTemp(e);
+    if (e->type->isRef())
+      p.proj.push_back({Proj::Deref});
+    return p;
+  }
+
+  Operand discriminant(Place p, SourceLoc loc) {
+    int t = newTemp(tc_.intTy(), loc);
+    Rvalue rv;
+    rv.kind = Rvalue::Discriminant;
+    rv.place = std::move(p);
+    rv.type = tc_.intTy();
+    assign(Place{t, {}}, std::move(rv), loc);
+    return copyOf(Place{t, {}}, tc_.intTy());
+  }
+
+  Operand isVariant(Operand disc, int variant, SourceLoc loc) {
+    int c = newTemp(tc_.boolTy(), loc);
+    Rvalue eq;
+    eq.kind = Rvalue::BinaryOp;
+    eq.bop = BinOp::Eq;
+    eq.type = tc_.boolTy();
+    eq.ops.push_back(std::move(disc));
+    eq.ops.push_back(constInt(variant, tc_.intTy()));
+    assign(Place{c, {}}, std::move(eq), loc);
+    return copyOf(Place{c, {}}, tc_.boolTy());
+  }
+
+  // `opt or fallback`
+  void lowerOrElse(Place dest, const BinaryExpr *b) {
+    Type *optTy = b->lhs->type->derefAll();
+    Type *inner = optTy->en->optionalOf;
+    if (b->orBorrows || b->lhs->type->isRef()) {
+      // Look into the optional in place.
+      Place p = enumPlace(b->lhs.get());
+      Operand c = isVariant(discriminant(p, b->loc), 1, b->loc);
+      int someBB = newBlock(), noneBB = newBlock(), join = newBlock();
+      branch(c, someBB, noneBB, b->loc);
+      cur_ = someBB;
+      Place payload = p.withProj({Proj::VariantField, 0, -1, 1});
+      if (b->orBorrows && !inner->isRef()) {
+        Rvalue ref;
+        ref.kind = Rvalue::Ref;
+        ref.place = payload;
+        ref.type = b->type;
+        assign(dest, std::move(ref), b->loc);
+      } else {
+        assign(dest, use(useOf(payload, inner, b->loc)), b->loc);
+      }
+      gotoBlock(join, b->loc);
+      cur_ = noneBB;
+      lowerInto(dest, b->rhs.get());
+      gotoBlock(join, b->loc);
+      cur_ = join;
+      return;
+    }
+    int t = newTemp(optTy, b->loc);
+    lowerInto(Place{t, {}}, b->lhs.get());
+    Operand c = isVariant(discriminant(Place{t, {}}, b->loc), 1, b->loc);
+    int someBB = newBlock(), noneBB = newBlock(), join = newBlock();
+    branch(c, someBB, noneBB, b->loc);
+    cur_ = someBB;
+    Operand val;
+    if (b->type == optTy) {
+      val.kind = optTy->isCopy() ? Operand::Copy : Operand::Move;
+      val.place = Place{t, {}};
+      val.type = optTy;
+    } else {
+      // Taking the payload consumes the whole temporary.
+      val.kind = inner->isCopy() ? Operand::Copy : Operand::Move;
+      val.place = Place{t, {}}.withProj({Proj::VariantField, 0, -1, 1});
+      val.type = inner;
+    }
+    assign(dest, use(val), b->loc);
+    gotoBlock(join, b->loc);
+    cur_ = noneBB;
+    lowerInto(dest, b->rhs.get());
+    gotoBlock(join, b->loc);
+    cur_ = join;
+  }
+
   void lowerInto(Place dest, const Expr *e) {
     SourceLoc loc = e->loc;
     switch (e->kind) {
+    case ExprKind::NoneLit: {
+      Operand z;
+      z.kind = Operand::Const;
+      z.c.kind = Constant::Zero; // variant 0 (none) with no payload
+      z.type = e->type;
+      assign(dest, use(z), loc);
+      return;
+    }
+    case ExprKind::EnumLit: {
+      auto *el = static_cast<const EnumLitExpr *>(e);
+      Rvalue rv;
+      rv.kind = Rvalue::Aggregate;
+      rv.variant = el->variant;
+      rv.type = e->type;
+      for (auto &a : el->args)
+        rv.ops.push_back(lowerArg(a.get()));
+      assign(dest, std::move(rv), loc);
+      return;
+    }
     case ExprKind::IntLit:
     case ExprKind::FloatLit:
     case ExprKind::BoolLit:
@@ -335,7 +441,13 @@ private:
       case UnOp::RefMut:
         rv.kind = Rvalue::Ref;
         rv.mut = u->op == UnOp::RefMut;
-        rv.place = placeOrTemp(u->operand.get());
+        if (extendScope_ >= 0 && !isPlaceExpr(u->operand.get())) {
+          int t = newLocal("", u->operand->type, u->operand->loc, extendScope_);
+          lowerInto(Place{t, {}}, u->operand.get());
+          rv.place = Place{t, {}};
+        } else {
+          rv.place = placeOrTemp(u->operand.get());
+        }
         break;
       case UnOp::ReborrowShared:
       case UnOp::ReborrowMut:
@@ -366,8 +478,26 @@ private:
         assign(dest, use(copyOf(Place{r, {}}, tc_.boolTy())), loc);
         return;
       }
+      if (b->op == BinOp::OrElse) {
+        lowerOrElse(dest, b);
+        return;
+      }
       Rvalue rv;
       rv.type = e->type;
+      if (b->noneCheck) {
+        // Compares which variant is active (`opt == none`, `dir == North`).
+        auto disc = [&](const Expr *x) {
+          if (x->kind == ExprKind::NoneLit)
+            return constInt(0, tc_.intTy());
+          return discriminant(enumPlace(x), x->loc);
+        };
+        rv.kind = Rvalue::BinaryOp;
+        rv.bop = b->op;
+        rv.ops.push_back(disc(b->lhs.get()));
+        rv.ops.push_back(disc(b->rhs.get()));
+        assign(dest, std::move(rv), loc);
+        return;
+      }
       bool strOp = b->lhs->type->isRef() && b->lhs->type->inner->kind == TypeKind::String;
       Operand l = lowerOperand(b->lhs.get());
       Operand r = lowerOperand(b->rhs.get());
@@ -459,10 +589,22 @@ private:
     rv.func = c->func;
     rv.ops.resize(c->args.size());
     size_t first = c->receiverLast ? 1 : 0;
+    auto note = [&](size_t i) {
+      Type *t = c->func->params[i];
+      if (t->isCopy() || c->args[i]->kind != ExprKind::Ident)
+        return std::string();
+      std::string var = static_cast<const IdentExpr *>(c->args[i].get())->name;
+      if (c->receiverLast && i == 0)
+        return "'" + var + "' is moved here because method '" + c->func->name +
+               "' takes its receiver by value; declare it as '(" + c->func->paramNames[0] + " &" + t->str() +
+               ")' to only lend it";
+      return "'" + var + "' is moved into '" + c->func->name + "' here; to only lend it, declare parameter '" +
+             c->func->paramNames[i] + "' as '&" + t->str() + "'";
+    };
     for (size_t i = first; i < c->args.size(); i++)
-      rv.ops[i] = lowerArg(c->args[i].get());
+      rv.ops[i] = lowerArg(c->args[i].get(), note(i));
     if (c->receiverLast)
-      rv.ops[0] = lowerArg(c->args[0].get());
+      rv.ops[0] = lowerArg(c->args[0].get(), note(0));
     return rv;
   }
 
@@ -498,6 +640,9 @@ private:
     case StmtKind::ForRange:
       lowerForRange(static_cast<const ForRangeStmt &>(s));
       return;
+    case StmtKind::Switch:
+      lowerSwitch(static_cast<const SwitchStmt &>(s));
+      return;
     default:
       break;
     }
@@ -522,23 +667,12 @@ private:
         assign(Place{l, {}}, use(z), vd.loc);
         return;
       }
-      const Expr *init = vd.init.get();
-      if (init->kind == ExprKind::Unary) {
-        auto *u = static_cast<const UnaryExpr *>(init);
-        if ((u->op == UnOp::Ref || u->op == UnOp::RefMut) && !isPlaceExpr(u->operand.get())) {
-          // `x := &value()` keeps the temporary alive as long as the block.
-          int t = newLocal("", u->operand->type, u->operand->loc, blockScope);
-          lowerInto(Place{t, {}}, u->operand.get());
-          Rvalue rv;
-          rv.kind = Rvalue::Ref;
-          rv.mut = u->op == UnOp::RefMut;
-          rv.place = Place{t, {}};
-          rv.type = init->type;
-          assign(Place{l, {}}, std::move(rv), init->loc);
-          return;
-        }
-      }
-      lowerInto(Place{l, {}}, init);
+      // `x := &value()` or `x := opt or "default"` keep the temporary alive
+      // as long as the block.
+      if (vd.init->type->containsRef())
+        extendScope_ = blockScope;
+      lowerInto(Place{l, {}}, vd.init.get());
+      extendScope_ = -1;
       return;
     }
     case StmtKind::Expr: {
@@ -573,9 +707,15 @@ private:
     }
     case StmtKind::Break:
     case StmtKind::Continue: {
-      const Loop &lp = loops_.back();
-      exitScopes(lp.scopeDepth, s.loc);
-      gotoBlock(s.kind == StmtKind::Break ? lp.breakBB : lp.continueBB, s.loc);
+      const Loop *lp = &loops_.back();
+      if (s.kind == StmtKind::Continue)
+        for (auto it = loops_.rbegin(); it != loops_.rend(); ++it)
+          if (!it->isSwitch) {
+            lp = &*it;
+            break;
+          }
+      exitScopes(lp->scopeDepth, s.loc);
+      gotoBlock(s.kind == StmtKind::Break ? lp->breakBB : lp->continueBB, s.loc);
       cur_ = newBlock();
       return;
     }
@@ -697,11 +837,127 @@ private:
     popScope(fs.body->endLoc);
   }
 
+  void lowerSwitch(const SwitchStmt &sw) {
+    pushScope();
+    int join = newBlock();
+    std::vector<int> bodies;
+    int defaultBody = -1;
+    for (auto &c : sw.cases) {
+      bodies.push_back(newBlock());
+      if (c.isDefault)
+        defaultBody = bodies.back();
+    }
+    Operand tag;
+    Place enumP;
+    bool strTag = false;
+    if (sw.mode == SwitchStmt::Enum) {
+      enumP = enumPlace(sw.tag.get());
+      tag = discriminant(enumP, sw.tag->loc);
+    } else if (sw.mode == SwitchStmt::Values) {
+      strTag = sw.tag->type->isRef();
+      tag = lowerArg(sw.tag.get());
+    }
+    // Tests, in source order.
+    for (size_t i = 0; i < sw.cases.size(); i++) {
+      const SwitchCase &c = sw.cases[i];
+      auto test = [&](Operand cond, SourceLoc loc) {
+        int next = newBlock();
+        branch(std::move(cond), bodies[i], next, loc);
+        cur_ = next;
+      };
+      if (sw.mode == SwitchStmt::Enum) {
+        for (int v : c.variants)
+          test(isVariant(tag, v, c.loc), c.loc);
+        continue;
+      }
+      for (auto &v : c.values) {
+        if (sw.mode == SwitchStmt::Conditions) {
+          test(lowerCond(v.get()), v->loc);
+          continue;
+        }
+        int cb = newTemp(tc_.boolTy(), v->loc);
+        Rvalue eq;
+        eq.type = tc_.boolTy();
+        eq.ops.push_back(tag);
+        eq.ops.push_back(lowerOperand(v.get()));
+        if (strTag) {
+          eq.kind = Rvalue::Builtin;
+          eq.builtin = BuiltinOp::StrCmp;
+          eq.cmp = BinOp::Eq;
+        } else {
+          eq.kind = Rvalue::BinaryOp;
+          eq.bop = BinOp::Eq;
+        }
+        assign(Place{cb, {}}, std::move(eq), v->loc);
+        test(copyOf(Place{cb, {}}, tc_.boolTy()), v->loc);
+      }
+    }
+    if (defaultBody >= 0) {
+      gotoBlock(defaultBody, sw.loc);
+    } else if (sw.exhaustive) {
+      Terminator t;
+      t.kind = Terminator::Unreachable;
+      t.loc = sw.loc;
+      terminate(t);
+    } else {
+      gotoBlock(join, sw.loc);
+    }
+
+    loops_.push_back({join, -1, scopes_.size(), true});
+    for (size_t i = 0; i < sw.cases.size(); i++) {
+      const SwitchCase &c = sw.cases[i];
+      cur_ = bodies[i];
+      pushScope();
+      if (sw.mode == SwitchStmt::Enum && c.variants.size() == 1) {
+        int vi = c.variants[0];
+        const Variant &var = sw.tag->type->derefAll()->en->variants[vi];
+        for (size_t j = 0; j < c.bindings.size(); j++) {
+          LocalVar *lv = c.bindings[j];
+          if (!lv)
+            continue;
+          int l = newLocal(lv->name, lv->type, lv->loc);
+          vars_[lv] = l;
+          Place field = enumP.withProj({Proj::VariantField, (int)j, -1, vi});
+          if (c.bindByRef[j]) {
+            Rvalue ref;
+            ref.kind = Rvalue::Ref;
+            ref.place = field;
+            ref.type = lv->type;
+            assign(Place{l, {}}, std::move(ref), lv->loc);
+          } else {
+            assign(Place{l, {}}, use(copyOf(field, var.fields[j])), lv->loc);
+          }
+        }
+      }
+      for (auto &st : c.body)
+        lowerStmt(*st);
+      SourceLoc end = i + 1 < sw.cases.size() ? sw.cases[i + 1].loc : c.loc;
+      popScope(end);
+      gotoBlock(join, end);
+    }
+    loops_.pop_back();
+    cur_ = join;
+    popScope(sw.loc);
+  }
+
   void lowerForRange(const ForRangeStmt &fr) {
     pushScope();
     Type *intTy = tc_.intTy();
     int n = newTemp(intTy, fr.range->loc);
-    lowerInto(Place{n, {}}, fr.range.get());
+    int slice = -1;
+    if (fr.overSlice) {
+      // The slice stays borrowed for the whole loop when elements are used.
+      slice = newTemp(fr.range->type, fr.range->loc);
+      lowerInto(Place{slice, {}}, fr.range.get());
+      Rvalue len;
+      len.kind = Rvalue::Builtin;
+      len.builtin = BuiltinOp::Len;
+      len.type = intTy;
+      len.ops.push_back(copyOf(Place{slice, {}}, fr.range->type));
+      assign(Place{n, {}}, std::move(len), fr.range->loc);
+    } else {
+      lowerInto(Place{n, {}}, fr.range.get());
+    }
     int i = newTemp(intTy, fr.loc);
     assign(Place{i, {}}, use(constInt(0, intTy)), fr.loc);
     int header = newBlock(), body = newBlock(), cont = newBlock(), exit = newBlock();
@@ -723,6 +979,21 @@ private:
     int v = newLocal(fr.name, intTy, fr.nameLoc);
     vars_[fr.var] = v;
     assign(Place{v, {}}, use(copyOf(Place{i, {}}, intTy)), fr.nameLoc);
+    if (fr.valueVar) {
+      Type *vt = fr.valueVar->type;
+      int x = newLocal(fr.valueName, vt, fr.valueLoc);
+      vars_[fr.valueVar] = x;
+      Place elem = Place{slice, {}}.withProj({Proj::Deref}).withProj({Proj::Index, -1, i});
+      if (fr.valueByRef) {
+        Rvalue ref;
+        ref.kind = Rvalue::Ref;
+        ref.place = elem;
+        ref.type = vt;
+        assign(Place{x, {}}, std::move(ref), fr.valueLoc);
+      } else {
+        assign(Place{x, {}}, use(copyOf(elem, vt)), fr.valueLoc);
+      }
+    }
     lowerBlock(*fr.body);
     popScope(fr.body->endLoc);
     loops_.pop_back();

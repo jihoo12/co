@@ -28,6 +28,12 @@ enum class Tok {
   KwTrue,
   KwFalse,
   KwMut,
+  KwEnum,
+  KwSwitch,
+  KwCase,
+  KwDefault,
+  KwNone,
+  KwOr,
   // punctuation
   LParen,
   RParen,
@@ -39,6 +45,7 @@ enum class Tok {
   Dot,
   Colon,
   Semi,
+  Question,
   // operators
   Plus,
   Minus,

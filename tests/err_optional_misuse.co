@@ -1,0 +1,9 @@
+// error: cannot tell the type of 'none' here
+// error: (the value may be missing: use 'x or default', or a switch with 'case some(v)')
+// error: 'or' needs an optional value
+func get() ?int { return 1 }
+func main() {
+    x := none
+    var y int = get()
+    z := 5 or 6
+}

@@ -26,6 +26,13 @@ const char *tokName(Tok t) {
   case Tok::KwTrue: return "'true'";
   case Tok::KwFalse: return "'false'";
   case Tok::KwMut: return "'mut'";
+  case Tok::KwEnum: return "'enum'";
+  case Tok::KwSwitch: return "'switch'";
+  case Tok::KwCase: return "'case'";
+  case Tok::KwDefault: return "'default'";
+  case Tok::KwNone: return "'none'";
+  case Tok::KwOr: return "'or'";
+  case Tok::Question: return "'?'";
   case Tok::LParen: return "'('";
   case Tok::RParen: return "')'";
   case Tok::LBrace: return "'{'";
@@ -75,6 +82,7 @@ static bool endsStatement(Tok t) {
   case Tok::KwContinue:
   case Tok::KwTrue:
   case Tok::KwFalse:
+  case Tok::KwNone:
   case Tok::RParen:
   case Tok::RBracket:
   case Tok::RBrace:
@@ -93,6 +101,8 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
       {"else", Tok::KwElse},     {"for", Tok::KwFor},     {"range", Tok::KwRange},
       {"break", Tok::KwBreak},   {"continue", Tok::KwContinue}, {"true", Tok::KwTrue},
       {"false", Tok::KwFalse},   {"mut", Tok::KwMut},
+      {"enum", Tok::KwEnum},     {"switch", Tok::KwSwitch}, {"case", Tok::KwCase},
+      {"default", Tok::KwDefault}, {"none", Tok::KwNone},  {"or", Tok::KwOr},
   };
 
   std::vector<Token> toks;
@@ -270,6 +280,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
     case ',': advance(); tok.kind = Tok::Comma; break;
     case '.': advance(); tok.kind = Tok::Dot; break;
     case ';': advance(); tok.kind = Tok::Semi; break;
+    case '?': advance(); tok.kind = Tok::Question; break;
     case ':': tok.kind = two('=', Tok::Define, Tok::Colon); break;
     case '=': tok.kind = two('=', Tok::Eq, Tok::Assign); break;
     case '!': tok.kind = two('=', Tok::Ne, Tok::Not); break;

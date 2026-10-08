@@ -1,0 +1,28 @@
+// expect: 3.14 6 0 0
+// expect: [Circle(1), Rect(2, 3), Label(hi), Empty]
+// expect: Label(hi) Label(hi)
+// expect: true false
+type Shape enum {
+    Circle(radius float)
+    Rect(w, h float)
+    Label(text string)
+    Empty
+}
+type Color enum { Red, Green, Blue }
+func area(s &Shape) float {
+    switch s {
+    case Circle(r): return 3.14 * r * r
+    case Rect(w, h): return w * h
+    case Label(_), Empty: return 0.0
+    }
+}
+func main() {
+    shapes := []Shape{Circle(1.0), Shape.Rect(2.0, 3.0), Label("hi"), Empty}
+    println(area(shapes[0]), area(shapes[1]), area(shapes[2]), area(shapes[3]))
+    println(shapes)
+    l := Label("hi")
+    l2 := clone(l)
+    println(l, l2)
+    c := Green
+    println(c == Green, c == Color.Blue)
+}

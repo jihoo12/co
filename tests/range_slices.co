@@ -1,0 +1,17 @@
+// expect: 6
+// expect: [2, 4, 6]
+// expect: 0:a 1:bb 2:ccc
+func main() {
+    v := []int{1, 2, 3}
+    sum := 0
+    for _, x := range v { sum += x }
+    println(sum)
+    for i := range v { v[i] *= 2 }     // index-only: v can be modified
+    println(v)
+    words := []string{"a", "bb", "ccc"}
+    for i, w := range words {          // w borrows each element
+        print(i, ":", w)
+        if i < 2 { print(" ") }
+    }
+    println()
+}

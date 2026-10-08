@@ -1,0 +1,93 @@
+// Enums, switch, optionals and range loops.
+
+type Shape enum {
+    Circle(radius float)
+    Rect(w, h float)
+    Label(text string)
+    Empty
+}
+
+type Dir enum { North, East, South, West }
+
+type User struct {
+    name  string
+    email ?string
+}
+
+func area(s &Shape) float {
+    switch s {
+    case Circle(r):
+        return 3.14159 * r * r
+    case Rect(w, h):
+        return w * h
+    case Label(_), Empty:
+        return 0.0
+    }
+}
+
+func find(users &[]User, name &string) ?int {
+    for i, u := range users {
+        if u.name == name {
+            return i            // wrapped as some(i) automatically
+        }
+    }
+    return none
+}
+
+func turn(d Dir) Dir {
+    switch d {
+    case North: return East
+    case East:  return South
+    case South: return West
+    default:    return North
+    }
+}
+
+func grade(score int) string {
+    switch {
+    case score >= 90: return "A"
+    case score >= 80: return "B"
+    default:          return "C"
+    }
+}
+
+func main() {
+    shapes := []Shape{Circle(1.0), Rect(2.0, 3.0), Label("hi"), Empty}
+    total := 0.0
+    for _, s := range shapes {
+        total += area(s)
+    }
+    println("total area:", total)
+    println(shapes)
+
+    users := []User{
+        User{name: "ann", email: "ann@example.com"},
+        User{name: "bob"},
+    }
+    for _, u := range users {
+        println(u.name, "->", u.email or "(no email)")
+    }
+
+    idx := find(users, "bob")       // users and "bob" are borrowed automatically
+    println("bob at", idx or -1, "zoe at", find(users, "zoe") or -1)
+    if find(users, "zoe") == none {
+        println("no zoe")
+    }
+    switch idx {
+    case some(i): println("found index", i)
+    case none:    println("missing")
+    }
+
+    d := North
+    for i := range 5 {
+        d = turn(d)
+    }
+    println("facing", d, d == East)
+
+    switch "b" + "ob" {
+    case "ann", "bob": println("known user")
+    default:           println("stranger")
+    }
+    println(grade(95), grade(85), grade(10))
+    println(users[1])
+}

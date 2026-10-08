@@ -86,11 +86,15 @@ private:
   TypeContext &tc_;
   Diagnostics &diag_;
   std::unordered_map<std::string, StructInfo *> structs_;
+  std::unordered_map<std::string, EnumInfo *> enums_;
+  // Variant names usable without the enum prefix; nullptr if ambiguous.
+  std::unordered_map<std::string, std::pair<EnumInfo *, int>> variants_;
   std::unordered_map<std::string, FuncInfo *> funcs_;
 
   FuncDecl *fn_ = nullptr;
   std::vector<std::unordered_map<std::string, LocalVar *>> scopes_;
   int loopDepth_ = 0;
+  int breakDepth_ = 0; // loops and switches
 
   void error(SourceLoc l, std::string msg) { diag_.error(l, std::move(msg)); }
 
@@ -104,11 +108,19 @@ private:
       if (t.name == "bool") return tc_.boolTy();
       if (t.name == "string") return tc_.stringTy();
       auto it = structs_.find(t.name);
-      if (it == structs_.end()) {
-        error(t.loc, "unknown type '" + t.name + "'");
+      if (it != structs_.end())
+        return tc_.structTy(it->second);
+      auto en = enums_.find(t.name);
+      if (en != enums_.end())
+        return tc_.enumTy(en->second);
+      error(t.loc, "unknown type '" + t.name + "'");
+      return nullptr;
+    }
+    case TypeExpr::Optional: {
+      Type *inner = resolveType(*t.inner);
+      if (!inner)
         return nullptr;
-      }
-      return tc_.structTy(it->second);
+      return tc_.optional(inner);
     }
     case TypeExpr::Ref: {
       Type *inner = resolveType(*t.inner);
@@ -124,7 +136,7 @@ private:
       Type *inner = resolveType(*t.inner);
       if (!inner)
         return nullptr;
-      if (inner->isRef()) {
+      if (inner->containsRef()) {
         error(t.loc, "slices cannot hold references (borrowed data can't be stored in containers)");
         return nullptr;
       }
@@ -134,10 +146,26 @@ private:
     return nullptr;
   }
 
+  bool typeNameTaken(const std::string &n) {
+    return structs_.count(n) || enums_.count(n) || n == "int" || n == "float" || n == "bool" ||
+           n == "string";
+  }
+
   void declareStructs() {
+    for (auto &ed : prog_.enums) {
+      if (typeNameTaken(ed->name)) {
+        error(ed->loc, "type '" + ed->name + "' is already defined");
+        continue;
+      }
+      auto info = std::make_unique<EnumInfo>();
+      info->name = ed->name;
+      info->loc = ed->loc;
+      ed->info = info.get();
+      enums_[ed->name] = info.get();
+      prog_.enumInfos.push_back(std::move(info));
+    }
     for (auto &sd : prog_.structs) {
-      if (structs_.count(sd->name) || sd->name == "int" || sd->name == "float" ||
-          sd->name == "bool" || sd->name == "string") {
+      if (typeNameTaken(sd->name)) {
         error(sd->loc, "type '" + sd->name + "' is already defined");
         continue;
       }
@@ -155,7 +183,7 @@ private:
         Type *ty = resolveType(*f.type);
         if (!ty)
           continue;
-        if (ty->isRef()) {
+        if (ty->containsRef()) {
           error(f.loc, "struct fields cannot be references (borrowed data can't be stored in structs); "
                        "store an owned value instead");
           continue;
@@ -168,36 +196,97 @@ private:
         sd->info->fields.push_back({f.name, ty, f.loc});
       }
     }
-    // Reject infinitely sized structs and compute which ones need drop glue.
-    std::unordered_map<StructInfo *, int> state; // 0 = new, 1 = visiting, 2 = done
-    std::function<bool(StructInfo *)> visit = [&](StructInfo *st) -> bool {
-      if (state[st] == 2)
-        return true;
-      if (state[st] == 1) {
-        error(st->loc, "recursive struct '" + st->name +
-                           "' has infinite size; use a slice ([]" + st->name + ") for indirection");
-        return false;
-      }
-      state[st] = 1;
-      bool ok = true;
-      st->needsDrop = false;
-      for (auto &f : st->fields) {
-        if (f.type->kind == TypeKind::Struct) {
-          ok = visit(f.type->st) && ok;
-          if (f.type->st->needsDrop)
-            st->needsDrop = true;
-        } else if (f.type->needsDrop()) {
-          st->needsDrop = true;
+    for (auto &ed : prog_.enums) {
+      if (!ed->info)
+        continue;
+      EnumInfo *en = ed->info;
+      for (auto &vd : ed->variants) {
+        if (en->variantIndex.count(vd.name)) {
+          error(vd.loc, "duplicate variant '" + vd.name + "'");
+          continue;
         }
+        Variant v;
+        v.name = vd.name;
+        v.loc = vd.loc;
+        for (auto &fte : vd.fields) {
+          Type *ft = resolveType(*fte);
+          if (ft && ft->containsRef()) {
+            error(fte->loc, "enum variants cannot hold references; store an owned value instead");
+            ft = nullptr;
+          }
+          v.fields.push_back(ft ? ft : tc_.intTy());
+        }
+        en->variantIndex[v.name] = (int)en->variants.size();
+        auto it = variants_.find(v.name);
+        if (it == variants_.end())
+          variants_[v.name] = {en, (int)en->variants.size()};
+        else
+          it->second.first = nullptr; // ambiguous: needs `Enum.Variant`
+        en->variants.push_back(std::move(v));
       }
+      if (en->variants.empty())
+        error(ed->loc, "enum '" + en->name + "' needs at least one variant");
+    }
+
+    // Reject infinitely sized types and compute which ones need drop glue.
+    std::unordered_map<const void *, int> state; // 0 = new, 1 = visiting, 2 = done
+    std::function<bool(Type *)> visitType;
+    auto enter = [&](const void *key, const std::string &name, SourceLoc loc) -> int {
+      if (state[key] == 2)
+        return 2;
+      if (state[key] == 1) {
+        error(loc, "recursive type '" + name + "' has infinite size; use a slice ([]" + name +
+                       ") for indirection");
+        return 1;
+      }
+      state[key] = 1;
+      return 0;
+    };
+    std::function<bool(StructInfo *)> visitStruct = [&](StructInfo *st) -> bool {
+      int s = enter(st, st->name, st->loc);
+      if (s)
+        return s == 2;
+      bool ok = true;
+      for (auto &f : st->fields)
+        ok = visitType(f.type) && ok;
+      st->needsDrop = false;
+      for (auto &f : st->fields)
+        st->needsDrop |= f.type->needsDrop();
       state[st] = 2;
       return ok;
     };
+    std::function<bool(EnumInfo *)> visitEnum = [&](EnumInfo *en) -> bool {
+      int s = enter(en, en->name, en->loc);
+      if (s)
+        return s == 2;
+      bool ok = true;
+      for (auto &v : en->variants)
+        for (Type *ft : v.fields)
+          ok = visitType(ft) && ok;
+      en->needsDrop = false;
+      for (auto &v : en->variants)
+        for (Type *ft : v.fields)
+          en->needsDrop |= ft->needsDrop();
+      en->isCopy = !en->needsDrop;
+      state[en] = 2;
+      return ok;
+    };
+    visitType = [&](Type *t) -> bool {
+      switch (t->kind) {
+      case TypeKind::Struct: return visitStruct(t->st);
+      case TypeKind::Enum: return t->en->optionalOf ? visitType(t->en->optionalOf) : visitEnum(t->en);
+      default: return true; // slices and references add indirection
+      }
+    };
     for (auto &info : prog_.structInfos)
-      if (!visit(info.get())) {
+      if (!visitStruct(info.get())) {
         info->fields.clear(); // prevent further cascades
         info->fieldIndex.clear();
       }
+    for (auto &info : prog_.enumInfos)
+      if (!visitEnum(info.get()))
+        for (auto &v : info->variants)
+          v.fields.clear();
   }
 
   void declareFuncs() {
@@ -220,7 +309,7 @@ private:
           info->recvStruct = rt->derefAll()->st;
           info->params.push_back(rt);
           info->paramNames.push_back(fd->receiver->name);
-          refParams += rt->isRef();
+          refParams += rt->containsRef();
         }
       }
       for (auto &p : fd->params) {
@@ -228,7 +317,7 @@ private:
         if (!pt)
           ok = false;
         else
-          refParams += pt->isRef();
+          refParams += pt->containsRef();
         info->params.push_back(pt);
         info->paramNames.push_back(p.name);
       }
@@ -237,7 +326,7 @@ private:
         info->ret = resolveType(*fd->ret);
         if (!info->ret) {
           ok = false;
-        } else if (info->ret->isRef() && refParams == 0) {
+        } else if (info->ret->containsRef() && refParams == 0) {
           error(fd->ret->loc, "function returns a reference but has no reference parameters to borrow "
                               "from; return an owned value instead");
           ok = false;
@@ -359,6 +448,10 @@ private:
           error(vd.init->loc, "expression produces no value");
           ty = nullptr;
         }
+        if (ty && ty->kind == TypeKind::None) {
+          error(vd.init->loc, "cannot tell the type of 'none' here; write 'var " + vd.name + " ?T = none'");
+          ty = nullptr;
+        }
       } else if (ty && ty->isRef()) {
         error(vd.loc, "reference variable '" + vd.name + "' must be initialized");
       }
@@ -414,7 +507,9 @@ private:
       if (fs.post)
         checkStmt(*fs.post);
       loopDepth_++;
+      breakDepth_++;
       checkBlock(*fs.body);
+      breakDepth_--;
       loopDepth_--;
       scopes_.pop_back();
       break;
@@ -422,17 +517,38 @@ private:
     case StmtKind::ForRange: {
       auto &fr = static_cast<ForRangeStmt &>(s);
       Type *t = check(fr.range);
-      if (t && t->kind != TypeKind::Int)
-        error(fr.range->loc, "range expects an int (iterates 0..n-1), found '" + t->str() + "'");
+      Type *elemTy = nullptr;
+      if (t && t->derefAll()->kind == TypeKind::Slice) {
+        fr.overSlice = true;
+        Type *et = t->derefAll()->inner;
+        fr.valueByRef = !et->isCopy();
+        elemTy = fr.valueByRef ? tc_.ref(et, false) : et;
+        autoRefShared(fr.range); // iterating borrows the slice; it is not consumed
+      } else if (t && t->kind != TypeKind::Int) {
+        error(fr.range->loc, "range expects an int (iterates 0..n-1) or a slice, found '" + t->str() + "'");
+      } else if (t && !fr.valueName.empty()) {
+        error(fr.valueLoc, "range over an int gives only one value: write 'for i := range n'");
+      }
       scopes_.emplace_back();
       fr.var = newVar(fr.name, tc_.intTy(), fr.nameLoc);
-      declare(fr.var);
+      if (fr.name != "_")
+        declare(fr.var);
+      if (!fr.valueName.empty() && elemTy) {
+        fr.valueVar = newVar(fr.valueName, elemTy, fr.valueLoc);
+        if (fr.valueName != "_")
+          declare(fr.valueVar);
+      }
       loopDepth_++;
+      breakDepth_++;
       checkBlock(*fr.body);
+      breakDepth_--;
       loopDepth_--;
       scopes_.pop_back();
       break;
     }
+    case StmtKind::Switch:
+      checkSwitch(static_cast<SwitchStmt &>(s));
+      break;
     case StmtKind::Return: {
       auto &rs = static_cast<ReturnStmt &>(s);
       Type *ret = fn_->info->ret;
@@ -449,10 +565,178 @@ private:
       break;
     }
     case StmtKind::Break:
+      if (breakDepth_ == 0)
+        error(s.loc, "break outside of a loop or switch");
+      break;
     case StmtKind::Continue:
       if (loopDepth_ == 0)
-        error(s.loc, std::string(s.kind == StmtKind::Break ? "break" : "continue") + " outside of a loop");
+        error(s.loc, "continue outside of a loop");
       break;
+    }
+  }
+
+  void checkCaseBody(SwitchCase &c) {
+    breakDepth_++;
+    for (auto &st : c.body)
+      checkStmt(*st);
+    breakDepth_--;
+  }
+
+  // Resolves a case pattern like `Circle(r, _)`, `Empty`, `some(x)` or `none`
+  // against enum `en`. Returns the variant index, or -1. `binds` receives the
+  // names (and locations) to bind, "_" for ignored fields.
+  int resolvePattern(Expr *e, EnumInfo *en, std::vector<std::pair<std::string, SourceLoc>> &binds) {
+    std::string name;
+    std::vector<ExprPtr> *args = nullptr;
+    Expr *callee = e;
+    if (e->kind == ExprKind::Call) {
+      auto *c = static_cast<CallExpr *>(e);
+      callee = c->callee.get();
+      args = &c->args;
+    }
+    if (callee->kind == ExprKind::Ident) {
+      name = static_cast<IdentExpr *>(callee)->name;
+    } else if (callee->kind == ExprKind::Field) {
+      auto *fe = static_cast<FieldExpr *>(callee);
+      if (fe->base->kind != ExprKind::Ident || static_cast<IdentExpr *>(fe->base.get())->name != en->name) {
+        error(e->loc, "expected a variant of '" + en->name + "' here");
+        return -1;
+      }
+      name = fe->name;
+    } else if (callee->kind == ExprKind::NoneLit && en->optionalOf) {
+      name = "none";
+    } else {
+      error(e->loc, "expected a variant of '" + en->name + "' here, like 'case " + en->variants[0].name + "'");
+      return -1;
+    }
+    auto it = en->variantIndex.find(name);
+    if (it == en->variantIndex.end()) {
+      error(callee->loc, "'" + en->name + "' has no variant '" + name + "'");
+      return -1;
+    }
+    const Variant &v = en->variants[it->second];
+    size_t given = args ? args->size() : 0;
+    if (given != v.fields.size()) {
+      std::string want = v.name;
+      if (!v.fields.empty()) {
+        want += "(";
+        for (size_t i = 0; i < v.fields.size(); i++)
+          want += std::string(i ? ", " : "") + "x" + std::to_string(i + 1);
+        want += ")";
+      }
+      error(e->loc, "variant '" + v.name + "' has " + std::to_string(v.fields.size()) +
+                        " value(s); write 'case " + want + "'");
+      return -1;
+    }
+    for (size_t i = 0; i < given; i++) {
+      Expr *a = (*args)[i].get();
+      if (a->kind != ExprKind::Ident) {
+        error(a->loc, "expected a name to bind (or '_') in pattern");
+        return -1;
+      }
+      binds.push_back({static_cast<IdentExpr *>(a)->name, a->loc});
+    }
+    return it->second;
+  }
+
+  void checkSwitch(SwitchStmt &sw) {
+    int defaults = 0;
+    for (auto &c : sw.cases)
+      if (c.isDefault && ++defaults == 2)
+        error(c.loc, "switch has more than one 'default'");
+
+    if (!sw.tag) {
+      sw.mode = SwitchStmt::Conditions;
+      for (auto &c : sw.cases) {
+        for (auto &v : c.values)
+          checkCond(v);
+        scopes_.emplace_back();
+        checkCaseBody(c);
+        scopes_.pop_back();
+      }
+      return;
+    }
+
+    Type *tt = check(sw.tag);
+    if (!tt)
+      return;
+    Type *base = tt->derefAll();
+    if (base->kind == TypeKind::Enum) {
+      sw.mode = SwitchStmt::Enum;
+      EnumInfo *en = base->en;
+      std::vector<bool> covered(en->variants.size(), false);
+      for (auto &c : sw.cases) {
+        scopes_.emplace_back();
+        for (auto &v : c.values) {
+          std::vector<std::pair<std::string, SourceLoc>> binds;
+          int vi = resolvePattern(v.get(), en, binds);
+          if (vi < 0)
+            continue;
+          if (covered[vi])
+            error(v->loc, "variant '" + en->variants[vi].name + "' is already handled by an earlier case");
+          covered[vi] = true;
+          c.variants.push_back(vi);
+          if (c.values.size() > 1) {
+            for (auto &b : binds)
+              if (b.first != "_")
+                error(b.second, "a case with several variants cannot bind values; use '_'");
+            continue;
+          }
+          for (size_t i = 0; i < binds.size(); i++) {
+            Type *ft = en->variants[vi].fields[i];
+            // Switching never consumes the value: owned payloads are borrowed.
+            bool byRef = !ft->isCopy();
+            c.bindByRef.push_back(byRef);
+            if (binds[i].first == "_") {
+              c.bindings.push_back(nullptr);
+              continue;
+            }
+            LocalVar *lv = newVar(binds[i].first, byRef ? tc_.ref(ft, false) : ft, binds[i].second);
+            declare(lv);
+            c.bindings.push_back(lv);
+          }
+        }
+        checkCaseBody(c);
+        scopes_.pop_back();
+      }
+      if (!defaults) {
+        std::string missing;
+        for (size_t i = 0; i < covered.size(); i++)
+          if (!covered[i])
+            missing += std::string(missing.empty() ? "" : ", ") + en->variants[i].name;
+        if (!missing.empty())
+          error(sw.loc, "switch on '" + en->name + "' does not handle: " + missing + " (add the cases or a 'default')");
+        else
+          sw.exhaustive = true;
+      }
+      return;
+    }
+
+    sw.mode = SwitchStmt::Values;
+    bool isStr = base->kind == TypeKind::String;
+    if (!isStr && !(tt->kind == TypeKind::Int || tt->kind == TypeKind::Float || tt->kind == TypeKind::Bool)) {
+      error(sw.tag->loc, "cannot switch on a value of type '" + tt->str() + "'");
+      return;
+    }
+    if (isStr)
+      autoRefShared(sw.tag);
+    for (auto &c : sw.cases) {
+      for (auto &v : c.values) {
+        Type *vt = check(v);
+        if (!vt)
+          continue;
+        if (isStr) {
+          if (vt->derefAll()->kind != TypeKind::String)
+            error(v->loc, "case value must be a string, found '" + vt->str() + "'");
+          else
+            autoRefShared(v);
+        } else {
+          coerce(v, tt);
+        }
+      }
+      scopes_.emplace_back();
+      checkCaseBody(c);
+      scopes_.pop_back();
     }
   }
 
@@ -581,11 +865,41 @@ private:
     e = wrap(std::move(e), UnOp::Ref, tc_.ref(t, false));
   }
 
-  // Implicit conversions at assignment/argument/return sites.
-  bool coerce(ExprPtr &e, Type *target) {
+  ExprPtr makeVariant(SourceLoc l, Type *enumTy, int variant, std::vector<ExprPtr> args) {
+    auto lit = std::make_unique<EnumLitExpr>(l, enumTy->en, variant);
+    lit->args = std::move(args);
+    lit->type = enumTy;
+    return lit;
+  }
+
+  // Implicit conversions at assignment/argument/return sites. Arguments
+  // (`isArg`) are also borrowed automatically when the parameter is `&T`.
+  bool coerce(ExprPtr &e, Type *target, bool isArg = false) {
     Type *t = e->type;
     if (!t || !target)
       return false;
+    if (target->isOptional() && t != target) {
+      if (t->kind == TypeKind::None) {
+        e = makeVariant(e->loc, target, 0, {});
+        return true;
+      }
+      if (!coerce(e, target->en->optionalOf, isArg))
+        return false;
+      SourceLoc l = e->loc;
+      std::vector<ExprPtr> args;
+      args.push_back(std::move(e));
+      e = makeVariant(l, target, 1, std::move(args));
+      return true;
+    }
+    if (isArg && target->isRef() && !t->isRef() && target->inner == t) {
+      if (!target->mut) {
+        e = wrap(std::move(e), UnOp::Ref, target);
+        return true;
+      }
+      error(e->loc, "this function may change its argument, so pass it as '&mut " + exprStr(e.get()) +
+                        "' to allow that");
+      return false;
+    }
     if (t == target) {
       // Passing a `&mut` place reborrows instead of moving the reference.
       if (t->isMutRef() && isPlace(e.get()))
@@ -597,7 +911,11 @@ private:
       return true;
     }
     std::string hint;
-    if (target->isRef() && !t->isRef() && target->inner == t)
+    if (t->kind == TypeKind::None)
+      hint = " ('none' can only be used where an optional '?T' is expected)";
+    else if (t->isOptional() && t->en->optionalOf == target)
+      hint = " (the value may be missing: use 'x or default', or a switch with 'case some(v)')";
+    else if (target->isRef() && !t->isRef() && target->inner == t)
       hint = std::string(" (add '") + (target->mut ? "&mut" : "&") + "' to pass a reference)";
     else if (t->isRef() && !target->isRef() && t->inner == target)
       hint = target->isCopy() ? " (use '*' to dereference)" : " (use clone(x) to copy the value)";
@@ -619,12 +937,17 @@ private:
     case ExprKind::FloatLit: return tc_.floatTy();
     case ExprKind::StrLit: return tc_.stringTy();
     case ExprKind::BoolLit: return tc_.boolTy();
+    case ExprKind::NoneLit: return tc_.noneTy();
+    case ExprKind::EnumLit: return e->type;
     case ExprKind::Ident: {
       auto *id = static_cast<IdentExpr *>(e.get());
       if (id->var) // already resolved (e.g. append rewrite looked at it)
         return id->var->type;
       id->var = lookup(id->name);
       if (!id->var) {
+        Type *vt = nullptr;
+        if (enumConstructor(e, nullptr, id->name, id->loc, nullptr, vt))
+          return vt;
         if (funcs_.count(id->name) || kBuiltins.count(id->name))
           error(id->loc, "function '" + id->name + "' can only be called");
         else
@@ -638,9 +961,13 @@ private:
     case ExprKind::Binary:
       return checkBinary(*static_cast<BinaryExpr *>(e.get()));
     case ExprKind::Call:
-      return checkCall(*static_cast<CallExpr *>(e.get()));
+      return checkCall(*static_cast<CallExpr *>(e.get()), e);
     case ExprKind::Field: {
       auto *fe = static_cast<FieldExpr *>(e.get());
+      Type *vt = nullptr;
+      if (EnumInfo *en = enumPrefix(fe->base.get()))
+        if (enumConstructor(e, en, fe->name, fe->loc, nullptr, vt))
+          return vt;
       Type *bt = check(fe->base);
       if (!bt)
         return nullptr;
@@ -778,7 +1105,54 @@ private:
       error(b.loc, "mismatched types '" + lt->str() + "' and '" + rt->str() + "' in binary operation");
       return nullptr;
     };
+    if (b.op == BinOp::OrElse) {
+      Type *opt = lt->derefAll();
+      if (!opt->isOptional()) {
+        error(b.loc, "'or' needs an optional value (?T) on its left, found '" + lt->str() + "'");
+        return nullptr;
+      }
+      Type *inner = opt->en->optionalOf;
+      // Like switch, `or` on a variable (or through a reference) only looks:
+      // owned payloads come out borrowed.
+      if (!inner->isCopy() && (lt->isRef() || isPlace(b.lhs.get()))) {
+        b.orBorrows = true;
+        Type *res = inner->isRef() ? inner : tc_.ref(inner, false);
+        if (rt == inner && !inner->isRef())
+          b.rhs = wrap(std::move(b.rhs), UnOp::Ref, res);
+        else if (!coerce(b.rhs, res))
+          return nullptr;
+        return res;
+      }
+      if (rt == lt)
+        return lt;
+      if (!coerce(b.rhs, inner))
+        return nullptr;
+      return inner;
+    }
+    if ((b.op == BinOp::Eq || b.op == BinOp::Ne) &&
+        (lt->kind == TypeKind::None || rt->kind == TypeKind::None)) {
+      Type *other = lt->kind == TypeKind::None ? rt : lt;
+      if (!other->derefAll()->isOptional()) {
+        error(b.loc, "only optional values (?T) can be compared with 'none', not '" + other->str() + "'");
+        return nullptr;
+      }
+      b.noneCheck = true;
+      return tc_.boolTy();
+    }
+    if ((b.op == BinOp::Eq || b.op == BinOp::Ne) && lt->derefAll()->kind == TypeKind::Enum &&
+        lt->derefAll() == rt->derefAll()) {
+      EnumInfo *en = lt->derefAll()->en;
+      for (auto &v : en->variants)
+        if (!v.fields.empty()) {
+          error(b.loc, "'" + en->name + "' values can't be compared with '=='; use a switch to look inside them");
+          return nullptr;
+        }
+      b.noneCheck = true; // compares variants only
+      return tc_.boolTy();
+    }
     switch (b.op) {
+    case BinOp::OrElse:
+      return nullptr;
     case BinOp::And:
     case BinOp::Or:
       if (lt->kind != TypeKind::Bool || rt->kind != TypeKind::Bool) {
@@ -833,9 +1207,103 @@ private:
     return nullptr;
   }
 
-  Type *checkCall(CallExpr &c) {
-    if (c.callee->kind == ExprKind::Field)
+  // `Shape.Circle`: is `e` the name of an enum type (and not a variable)?
+  EnumInfo *enumPrefix(Expr *e) {
+    if (e->kind != ExprKind::Ident)
+      return nullptr;
+    auto *id = static_cast<IdentExpr *>(e);
+    if (lookup(id->name))
+      return nullptr;
+    auto it = enums_.find(id->name);
+    return it == enums_.end() ? nullptr : it->second;
+  }
+
+  // Tries to build an enum value from `name` (a variant of `en`, or an
+  // unqualified variant when en is null). `args` is null when used without
+  // parentheses. Replaces `e` and returns true if `name` is a variant.
+  bool enumConstructor(ExprPtr &e, EnumInfo *en, const std::string &name, SourceLoc loc,
+                       std::vector<ExprPtr> *args, Type *&out) {
+    out = nullptr;
+    int vi;
+    if (en) {
+      auto it = en->variantIndex.find(name);
+      if (it == en->variantIndex.end()) {
+        error(loc, "enum '" + en->name + "' has no variant '" + name + "'");
+        return true;
+      }
+      vi = it->second;
+    } else {
+      auto it = variants_.find(name);
+      if (it == variants_.end())
+        return false;
+      if (!it->second.first) {
+        error(loc, "'" + name + "' is a variant of several enums; write 'EnumName." + name + "'");
+        return true;
+      }
+      en = it->second.first;
+      vi = it->second.second;
+    }
+    const Variant &v = en->variants[vi];
+    size_t given = args ? args->size() : 0;
+    if (given != v.fields.size()) {
+      if (args)
+        for (auto &a : *args)
+          check(a);
+      error(loc, "variant '" + v.name + "' takes " + std::to_string(v.fields.size()) + " value(s), but " +
+                     std::to_string(given) + " were given");
+      return true;
+    }
+    Type *et = tc_.enumTy(en);
+    std::vector<ExprPtr> moved;
+    bool ok = true;
+    for (size_t i = 0; i < given; i++) {
+      ExprPtr &a = (*args)[i];
+      if (!check(a) || !coerce(a, v.fields[i]))
+        ok = false;
+      moved.push_back(std::move(a));
+    }
+    e = makeVariant(e->loc, et, vi, std::move(moved));
+    out = ok ? et : nullptr;
+    return true;
+  }
+
+  Type *checkCall(CallExpr &c, ExprPtr &self) {
+    Type *vt = nullptr;
+    if (c.callee->kind == ExprKind::Field) {
+      auto *fe = static_cast<FieldExpr *>(c.callee.get());
+      if (EnumInfo *en = enumPrefix(fe->base.get())) {
+        std::string name = fe->name;
+        enumConstructor(self, en, name, fe->loc, &c.args, vt);
+        return vt;
+      }
       return checkMethodCall(c);
+    }
+    if (c.callee->kind == ExprKind::Ident) {
+      auto *id = static_cast<IdentExpr *>(c.callee.get());
+      if (!lookup(id->name) && !kBuiltins.count(id->name) && !funcs_.count(id->name)) {
+        if (id->name == "some") {
+          if (c.args.size() != 1) {
+            error(c.loc, "some(x) takes one value");
+            return nullptr;
+          }
+          Type *at = check(c.args[0]);
+          if (!at)
+            return nullptr;
+          if (at->kind == TypeKind::None || at->kind == TypeKind::Void) {
+            error(c.args[0]->loc, "some(...) needs a value");
+            return nullptr;
+          }
+          Type *opt = tc_.optional(at);
+          std::vector<ExprPtr> args;
+          args.push_back(std::move(c.args[0]));
+          self = makeVariant(c.loc, opt, 1, std::move(args));
+          return opt;
+        }
+        std::string name = id->name;
+        if (enumConstructor(self, nullptr, name, id->loc, &c.args, vt))
+          return vt;
+      }
+    }
     if (c.callee->kind != ExprKind::Ident) {
       error(c.loc, "this expression cannot be called");
       return nullptr;
@@ -882,7 +1350,7 @@ private:
     }
     for (size_t i = first; i < c.args.size(); i++)
       if (c.args[i]->type)
-        coerce(c.args[i], f->params[i]);
+        coerce(c.args[i], f->params[i], true);
   }
 
   Type *checkMethodCall(CallExpr &c) {
@@ -959,12 +1427,12 @@ private:
         if (!t)
           continue;
         Type *base = t->derefAll();
-        if (base->kind == TypeKind::Int || base->kind == TypeKind::Float || base->kind == TypeKind::Bool) {
-          continue;
-        } else if (base->kind == TypeKind::String) {
-          autoRefShared(a);
-        } else {
+        if (base->kind == TypeKind::Void || base->kind == TypeKind::None) {
           error(a->loc, "cannot print a value of type '" + t->str() + "'");
+        } else if (base->kind == TypeKind::Int || base->kind == TypeKind::Float || base->kind == TypeKind::Bool) {
+          continue;
+        } else {
+          autoRefShared(a); // printing never consumes a value
         }
       }
       return tc_.voidTy();

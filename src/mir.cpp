@@ -24,6 +24,9 @@ std::string Function::placeName(const Place &p) const {
       s += "[..]";
       ty = ty->inner;
       break;
+    case Proj::VariantField:
+      ty = ty->en->variants[pr.variant].fields[pr.field];
+      break;
     }
   }
   return s;
@@ -36,6 +39,9 @@ static std::string placeStr(const Function &f, const Place &p) {
     case Proj::Deref: s = "(*" + s + ")"; break;
     case Proj::Field: s += "." + std::to_string(pr.field); break;
     case Proj::Index: s += "[_" + std::to_string(pr.indexLocal) + "]"; break;
+    case Proj::VariantField:
+      s = "(" + s + " as " + std::to_string(pr.variant) + ")." + std::to_string(pr.field);
+      break;
     }
   }
   return s;
@@ -71,6 +77,7 @@ static const char *bopStr(BinOp op) {
   case BinOp::Ge: return "Ge";
   case BinOp::And: return "And";
   case BinOp::Or: return "Or";
+  case BinOp::OrElse: return "OrElse";
   }
   return "?";
 }
@@ -121,7 +128,13 @@ void print(const Function &f, std::string &out) {
         case Rvalue::BinaryOp: out += std::string(bopStr(rv.bop)) + "(" + ops() + ")"; break;
         case Rvalue::UnaryOp: out += std::string(rv.uop == UnOp::Neg ? "Neg" : "Not") + "(" + ops() + ")"; break;
         case Rvalue::Ref: out += std::string(rv.mut ? "&mut " : "&") + placeStr(f, rv.place); break;
-        case Rvalue::Aggregate: out += rv.type->str() + " { " + ops() + " }"; break;
+        case Rvalue::Discriminant: out += "discriminant(" + placeStr(f, rv.place) + ")"; break;
+        case Rvalue::Aggregate:
+          out += rv.type->str();
+          if (rv.variant >= 0)
+            out += "::" + rv.type->en->variants[rv.variant].name;
+          out += " { " + ops() + " }";
+          break;
         case Rvalue::SliceLit: out += rv.type->str() + " [" + ops() + "]"; break;
         case Rvalue::Call: out += rv.func->symbol + "(" + ops() + ")"; break;
         case Rvalue::Builtin:
