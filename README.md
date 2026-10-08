@@ -57,6 +57,38 @@ ctest --test-dir build            # or: python3 tests/run_tests.py build/bin/coc
 
 Or just `nix build` / `nix run . -- run examples/shapes.co`.
 
+### Install with Nix
+
+With [Nix flakes enabled](https://nixos.wiki/wiki/Flakes), install `coc` directly from GitHub:
+
+```sh
+nix profile install github:jihoo12/co
+coc --help
+```
+
+Run without installing, or build the package locally:
+
+```sh
+nix run github:jihoo12/co -- --help
+nix build github:jihoo12/co
+./result/bin/coc --help
+```
+
+To upgrade or remove a profile installation, use `nix profile upgrade` or
+`nix profile remove` with the entry name reported by `nix profile list`.
+
+For a NixOS or Home Manager flake, add `co` as an input:
+
+```nix
+inputs.co.url = "github:jihoo12/co";
+```
+
+Then add `inputs.co.packages.${pkgs.system}.default` to
+`environment.systemPackages` (NixOS) or `home.packages` (Home Manager),
+passing `inputs` to the module as usual. The package is also available as
+`packages.${system}.co`. Supported flake systems are x86_64/aarch64 Linux and macOS.
+
+
 ```
 coc run   file.co                 # compile and run
 coc build file.co [-o out] [-O0..-O3] [--emit-llvm] [--emit-mir]

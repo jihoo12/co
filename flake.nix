@@ -13,7 +13,7 @@
         let
           pkgs = pkgsFor system;
           llvm = pkgs.llvmPackages_22;
-        in {
+        in rec {
           default = llvm.stdenv.mkDerivation {
             pname = "co";
             version = "0.1.0";
@@ -25,6 +25,13 @@
               # Only used where coc can't link by itself (e.g. macOS).
               "-DCO_DEFAULT_CC=${llvm.stdenv.cc}/bin/cc"
             ];
+            meta = with pkgs.lib; {
+              description = "The co programming language compiler";
+              homepage = "https://github.com/jihoo12/co";
+              license = licenses.asl20;
+              mainProgram = "coc";
+              platforms = platforms.unix;
+            };
             doCheck = true;
             checkPhase = ''
               runHook preCheck
@@ -32,6 +39,7 @@
               runHook postCheck
             '';
           };
+          co = default;
         });
 
       apps = forAllSystems (system: {
