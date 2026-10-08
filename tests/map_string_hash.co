@@ -1,0 +1,43 @@
+// String keys of every length up to 30, plus pairs that differ only in the
+// last byte, so each path of the runtime's string hash and compare is used.
+// expect: 90
+// expect: 0 0
+// expect: 0
+// expect: 89
+func main() {
+    m := map[string]int{}
+    key := ""
+    for i := range 30 {
+        m[key] = i
+        key += "x"
+    }
+    base := ""
+    for n := range 30 {
+        m[base + "1"] = 100 + n
+        m[base + "2"] = 200 + n
+        base += "a"
+    }
+    println(len(m))
+
+    bad := 0
+    key = ""
+    for i := range 30 {
+        if (m[key] or -1) != i { bad++ }
+        key += "x"
+    }
+    base = ""
+    missing := 0
+    for n := range 30 {
+        if (m[base + "1"] or -1) != 100 + n { bad++ }
+        if (m[base + "2"] or -1) != 200 + n { bad++ }
+        if m[base + "3"] != none { missing++ }
+        base += "a"
+    }
+    println(bad, missing)
+
+    // A key that matches a stored one in its first and last bytes only.
+    println(m["aaaaaaaaaa?aaaaaaaaa1"] or 0)
+
+    delete(m, "")
+    println(len(m))
+}

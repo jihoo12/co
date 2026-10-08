@@ -63,7 +63,8 @@ coc build file.co [-o out] [-O0..-O3] [--emit-llvm] [--emit-mir]
 coc check file.co                 # only check for errors
 ```
 
-`coc` links with the system C compiler (`cc`, or `$CO_CC`); extra linker flags can go in `$CO_LDFLAGS`.
+`coc` is a single self-contained binary: the runtime is embedded in it. It links programs with the
+system C compiler (`cc`, or `$CO_CC`); extra linker flags can go in `$CO_LDFLAGS`.
 Running a program with `CO_DEBUG_ALLOC=1` prints the number of heap allocations still alive at exit
 (the test suite uses it to check that nothing leaks or is freed twice).
 
@@ -331,7 +332,8 @@ message (exit code 101). `panic("message")` does the same on purpose.
 # How the compiler works
 
 ```
-source ─► lexer ─► parser ─► AST ─► sema ─► MIR ─► borrow checker ─► LLVM IR ─► object ─► cc link
+source ─► lexer ─► parser ─► AST ─► sema ─► MIR ─► borrow checker ─► LLVM IR ─┐
+                                                       runtime bitcode ─► link ─┴─► optimize ─► object ─► cc link
 ```
 
 | file                  | role                                                                 |
@@ -342,7 +344,20 @@ source ─► lexer ─► parser ─► AST ─► sema ─► MIR ─► borro
 | `src/mir_build.cpp`   | lowers to MIR, a control-flow graph with explicit moves, drops and scope ends |
 | `src/borrowck.cpp`    | move/initialization dataflow, liveness, region inference, loan conflicts (NLL-style) |
 | `src/codegen.cpp`     | MIR → LLVM IR, drop flags, generated drop/clone/print glue, optimization |
-| `runtime/runtime.c`   | printing, strings, slices, panics                                    |
+| `runtime/runtime.c`   | printing, strings, slices, maps, panics                              |
+| `runtime/co_abi.h`    | memory layouts shared by the runtime and codegen                     |
+
+The runtime is written in C, compiled to LLVM bitcode at build time and embedded in `coc`. Every
+program is linked with it *before* optimization and everything but `main` is made internal, so the
+optimizer sees the whole program: runtime calls such as `append` or map lookups inline into user code
+and get specialized to the element and key types, and unused runtime code is dropped. Codegen checks
+each runtime call against the runtime's real signature, and both sides share the layouts in
+`co_abi.h`; maps are opaque to codegen apart from `len`.
+
+## Performance
+
+`bench/` has small programs with Go twins in `bench/go/`; `python3 bench/run.py build/bin/coc`
+times both (set `$GO` if `go` isn't on PATH).
 
 The borrow checker follows rustc's design: each local holding a reference gets a *region* (the set of
 program points where it may still be used); each `&`/`&mut` creates a *loan* that must stay valid

@@ -35,24 +35,6 @@ static void usage() {
           "  --emit-mir     print the MIR to stdout\n");
 }
 
-static std::string selfPath(const char *argv0) {
-  static int anchor;
-  return llvm::sys::fs::getMainExecutable(argv0, (void *)&anchor);
-}
-
-static std::string findRuntime(const char *argv0) {
-  if (const char *env = getenv("CO_RUNTIME"))
-    return env;
-  llvm::SmallString<256> dir(llvm::sys::path::parent_path(selfPath(argv0)));
-  llvm::SmallString<256> p(dir);
-  llvm::sys::path::append(p, "..", "lib", "libco_rt.a");
-  if (llvm::sys::fs::exists(p))
-    return std::string(p);
-  p = dir;
-  llvm::sys::path::append(p, "libco_rt.a");
-  return std::string(p);
-}
-
 static int runProgram(const std::string &prog, const std::vector<std::string> &args) {
   std::vector<llvm::StringRef> refs;
   refs.push_back(prog);
@@ -176,8 +158,8 @@ int main(int argc, char **argv) {
     llvm::sys::fs::remove(obj);
     return 1;
   }
-  std::string runtime = findRuntime(argv[0]);
-  std::vector<std::string> linkArgs = {std::string(obj), runtime, "-o", output, "-lm"};
+  // The object already contains the runtime; cc adds the C library and startup code.
+  std::vector<std::string> linkArgs = {std::string(obj), "-o", output, "-lm"};
   if (const char *extra = getenv("CO_LDFLAGS")) {
     std::istringstream flags(extra);
     for (std::string f; flags >> f;)
@@ -186,7 +168,7 @@ int main(int argc, char **argv) {
   int rc = runProgram(*cc, linkArgs);
   llvm::sys::fs::remove(obj);
   if (rc != 0) {
-    fprintf(stderr, "coc: linking failed (runtime: %s)\n", runtime.c_str());
+    fprintf(stderr, "coc: linking failed\n");
     return 1;
   }
 

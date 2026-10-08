@@ -1,0 +1,19 @@
+// Inserting, reading and deleting int keys.
+
+func main() {
+    m := map[int]int{}
+    n := 2000000
+    for i := range n {
+        m[i * 7919 % n] = i
+    }
+    hits := 0
+    for round := range 5 {
+        for i := range n {
+            hits += m[i + round] or 0
+        }
+    }
+    for i := range n / 2 {
+        delete(m, i)
+    }
+    println(len(m), hits)
+}

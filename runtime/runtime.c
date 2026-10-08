@@ -1,15 +1,23 @@
-// co runtime: printing, strings, growable slices, panics.
-// Strings and slices share one layout: { ptr, len, cap }.
+// co runtime: printing, strings, growable slices, maps, panics.
+//
+// This file is compiled to LLVM bitcode, embedded in the compiler and linked
+// into every program before optimization, so these functions inline into
+// generated code. Keep hot paths small and rare paths out of line.
+
+// Fortified libc wrappers would be inlined into every program; some
+// toolchains (nix's clang) force them on from the command line.
+#undef _FORTIFY_SOURCE
+
+#include "co_abi.h"
+
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-  char *ptr;
-  int64_t len;
-  int64_t cap;
-} CoVec;
+#define CO_COLD __attribute__((noinline, cold))
+#define CO_LIKELY(x) __builtin_expect(!!(x), 1)
+#define CO_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 void co_main(void);
 
@@ -121,12 +129,15 @@ void co_vec_new(CoVec *out, int64_t cap, int64_t elem_size) {
   out->cap = cap;
 }
 
+static CO_COLD void vec_grow(CoVec *v, int64_t elem_size) {
+  int64_t cap = v->cap ? v->cap * 2 : 4;
+  v->ptr = xrealloc(v->ptr, (size_t)(cap * elem_size));
+  v->cap = cap;
+}
+
 void co_vec_push(CoVec *v, const void *elem, int64_t elem_size) {
-  if (v->len == v->cap) {
-    int64_t cap = v->cap ? v->cap * 2 : 4;
-    v->ptr = xrealloc(v->ptr, (size_t)(cap * elem_size));
-    v->cap = cap;
-  }
+  if (CO_UNLIKELY(v->len == v->cap))
+    vec_grow(v, elem_size);
   memcpy(v->ptr + v->len * elem_size, elem, (size_t)elem_size);
   v->len++;
 }
@@ -146,27 +157,55 @@ void co_vec_clone_bits(CoVec *out, const CoVec *src, int64_t elem_size) {
 // entry positions (+1; 0 = empty, -1 = deleted). An entry is:
 //   int64 alive | key (rounded up to 8 bytes) | value (rounded up to 8 bytes)
 // Keys are copied in (strings are cloned), so callers only lend keys.
-
-typedef struct {
-  char *entries;
-  int64_t len, used, cap;
-  int64_t *index;
-  int64_t icap;
-} CoMap;
-
-enum { KEY_INT = 0, KEY_BOOL = 1, KEY_STR = 2 };
+// The compiler passes `kind`, `ks` (key size) and `vs` (value size) as
+// constants; once inlined, each call site is specialized to its types.
 
 static int64_t round8(int64_t n) { return (n + 7) & ~(int64_t)7; }
 static int64_t entry_size(int64_t ks, int64_t vs) { return 8 + round8(ks) + round8(vs); }
 
+static uint64_t load64(const char *p) {
+  uint64_t v;
+  memcpy(&v, p, 8);
+  return v;
+}
+
+static uint64_t load32(const char *p) {
+  uint32_t v;
+  memcpy(&v, p, 4);
+  return v;
+}
+
+// 64x64 -> 128-bit multiply, folded to 64 bits (wyhash's mixing step).
+static uint64_t mix(uint64_t a, uint64_t b) {
+  __uint128_t r = (__uint128_t)a * b;
+  return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+
+// Hashes 8 bytes at a time, reading the tail with overlapping loads so it
+// never reads past the end or loops over single bytes.
+static uint64_t hash_bytes(const char *p, int64_t len) {
+  uint64_t n = (uint64_t)len, t;
+  uint64_t h = 0x9e3779b97f4a7c15ull ^ n;
+  if (n > 8) {
+    for (; n > 8; p += 8, n -= 8)
+      h = mix(h ^ load64(p), 0xa0761d6478bd642full);
+    t = load64(p + n - 8);
+  } else if (n >= 4) {
+    t = load32(p) << 32 | load32(p + n - 4);
+  } else if (n) {
+    t = (uint64_t)(unsigned char)p[0] << 16 | (uint64_t)(unsigned char)p[n >> 1] << 8 | (unsigned char)p[n - 1];
+  } else {
+    t = 0;
+  }
+  return mix(h ^ t, 0xe7037ed1a0b428dbull);
+}
+
 static uint64_t hash_key(const void *k, int kind) {
   uint64_t h;
-  if (kind == KEY_STR) {
+  if (kind == CO_KEY_STR) {
     const CoVec *s = k;
-    h = 1469598103934665603ull;
-    for (int64_t i = 0; i < s->len; i++)
-      h = (h ^ (unsigned char)s->ptr[i]) * 1099511628211ull;
-  } else if (kind == KEY_BOOL) {
+    return hash_bytes(s->ptr, s->len);
+  } else if (kind == CO_KEY_BOOL) {
     h = *(const unsigned char *)k ? 0x9e3779b97f4a7c15ull : 0x7f4a7c159e3779b9ull;
   } else {
     h = (uint64_t)*(const int64_t *)k;
@@ -177,12 +216,28 @@ static uint64_t hash_key(const void *k, int kind) {
   return h;
 }
 
-static int key_eq(const void *a, const void *b, int kind) {
-  if (kind == KEY_STR) {
-    const CoVec *x = a, *y = b;
-    return x->len == y->len && (x->len == 0 || memcmp(x->ptr, y->ptr, (size_t)x->len) == 0);
+// Compares n bytes like hash_bytes reads them, without calling memcmp.
+static int bytes_eq(const char *a, const char *b, int64_t n) {
+  if (n > 8) {
+    for (; n > 8; a += 8, b += 8, n -= 8)
+      if (load64(a) != load64(b))
+        return 0;
+    return load64(a + n - 8) == load64(b + n - 8);
   }
-  if (kind == KEY_BOOL)
+  if (n >= 4)
+    return load32(a) == load32(b) && load32(a + n - 4) == load32(b + n - 4);
+  for (int64_t i = 0; i < n; i++)
+    if (a[i] != b[i])
+      return 0;
+  return 1;
+}
+
+static int key_eq(const void *a, const void *b, int kind) {
+  if (kind == CO_KEY_STR) {
+    const CoVec *x = a, *y = b;
+    return x->len == y->len && bytes_eq(x->ptr, y->ptr, x->len);
+  }
+  if (kind == CO_KEY_BOOL)
     return (*(const unsigned char *)a != 0) == (*(const unsigned char *)b != 0);
   return *(const int64_t *)a == *(const int64_t *)b;
 }
@@ -210,7 +265,7 @@ static void index_insert(CoMap *m, int64_t entry, int kind, int64_t es) {
 }
 
 // Drops deleted entries and resizes to hold `cap` entries.
-static void map_rebuild(CoMap *m, int kind, int64_t es, int64_t cap) {
+static CO_COLD void map_rebuild(CoMap *m, int kind, int64_t es, int64_t cap) {
   char *entries = xrealloc(NULL, (size_t)(cap * es));
   int64_t n = 0;
   for (int64_t i = 0; i < m->used; i++) {
@@ -246,12 +301,12 @@ void *co_map_slot(CoMap *m, const void *key, int32_t kind, int64_t ks, int64_t v
   int64_t slot = find_slot(m, key, kind, es);
   if (slot >= 0)
     return m->entries + (m->index[slot] - 1) * es + 8 + round8(ks);
-  if (m->used == m->cap)
+  if (CO_UNLIKELY(m->used == m->cap))
     map_rebuild(m, kind, es, m->len * 2 < 8 ? 8 : m->len * 2);
   char *e = m->entries + m->used * es;
   memset(e, 0, (size_t)es);
   *(int64_t *)e = 1;
-  if (kind == KEY_STR)
+  if (kind == CO_KEY_STR)
     co_str_clone((CoVec *)(e + 8), key);
   else
     memcpy(e + 8, key, (size_t)ks);
@@ -269,7 +324,7 @@ int32_t co_map_delete(CoMap *m, const void *key, int32_t kind, int64_t ks, int64
     return 0;
   char *e = m->entries + (m->index[slot] - 1) * es;
   *(int64_t *)e = 0;
-  if (kind == KEY_STR)
+  if (kind == CO_KEY_STR)
     co_free(((CoVec *)(e + 8))->ptr);
   memcpy(out, e + 8 + round8(ks), (size_t)vs);
   m->index[slot] = -1;
@@ -297,6 +352,24 @@ void co_map_clone_bits(CoMap *dst, const CoMap *src, int64_t ks, int64_t vs) {
     dst->index = xrealloc(NULL, (size_t)src->icap * sizeof(int64_t));
     memcpy(dst->index, src->index, (size_t)src->icap * sizeof(int64_t));
   }
+}
+
+// Iteration: generated code walks entry slots 0..co_map_used(m), skipping
+// deleted ones, so the entry layout stays private to this file. A clone made
+// by co_map_clone_bits has its entries at the same slots as the original.
+
+int64_t co_map_used(const CoMap *m) { return m->used; }
+
+int32_t co_map_alive(const CoMap *m, int64_t i, int64_t ks, int64_t vs) {
+  return *(const int64_t *)(m->entries + i * entry_size(ks, vs)) != 0;
+}
+
+void *co_map_key_at(const CoMap *m, int64_t i, int64_t ks, int64_t vs) {
+  return m->entries + i * entry_size(ks, vs) + 8;
+}
+
+void *co_map_val_at(const CoMap *m, int64_t i, int64_t ks, int64_t vs) {
+  return m->entries + i * entry_size(ks, vs) + 8 + round8(ks);
 }
 
 int main(void) {

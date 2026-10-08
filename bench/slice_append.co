@@ -1,0 +1,15 @@
+// Growing a slice with append, then summing it.
+
+func main() {
+    total := 0
+    for round := range 20 {
+        nums := []int{}
+        for i := range 5000000 {
+            nums = append(nums, i + round)
+        }
+        for _, n := range nums {
+            total += n
+        }
+    }
+    println(total)
+}

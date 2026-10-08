@@ -1,0 +1,19 @@
+// Counting string keys.
+
+func main() {
+    words := []string{}
+    for i := range 200000 {
+        words = append(words, "w" + str(i % 50000))
+    }
+    counts := map[string]int{}
+    for round := range 20 {
+        for _, w := range words {
+            counts[w]++
+        }
+    }
+    total := 0
+    for _, c := range counts {
+        total += c
+    }
+    println(len(counts), total)
+}
