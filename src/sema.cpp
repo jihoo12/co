@@ -2659,10 +2659,12 @@ private:
       if (it != st->st->methods.end())
         m = it->second;
     }
-    if (!m && st->kind == TypeKind::Struct) {
-      // A field holding a function: `s.onClick(e)`.
-      auto fi = st->st->fieldIndex.find(fe->name);
-      if (fi != st->st->fieldIndex.end() && st->st->fields[fi->second].type->isFunc()) {
+    // A raw C pointer also permits field calls; check(c.callee) below verifies unsafe access.
+    Type *fieldSt = st->isPtr() && st->inner->kind == TypeKind::Struct ? st->inner : st;
+    if (!m && fieldSt->kind == TypeKind::Struct) {
+      // A field holding a function: `s.onClick(e)` or `p.onClick(e)`.
+      auto fi = fieldSt->st->fieldIndex.find(fe->name);
+      if (fi != fieldSt->st->fieldIndex.end() && fieldSt->st->fields[fi->second].type->isFunc()) {
         Type *ft = check(c.callee);
         return ft ? checkIndirectCall(c, ft) : nullptr;
       }

@@ -1,0 +1,11 @@
+// error: reading a field through a C pointer can only be done inside 'unsafe { ... }'
+type Handler struct { cb func(int) int }
+
+func twice(x int) int { return x * 2 }
+
+func main() {
+    h := Handler{cb: twice}
+    var p *Handler
+    unsafe { p = &h }
+    println(p.cb(1))
+}

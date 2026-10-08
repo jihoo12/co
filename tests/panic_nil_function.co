@@ -1,0 +1,6 @@
+// exit: 101
+// stderr: panic: call of nil function
+func main() {
+    var f func(int) int
+    println(f(1))
+}

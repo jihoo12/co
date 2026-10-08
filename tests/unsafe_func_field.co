@@ -1,0 +1,16 @@
+// A function-valued field can be called directly through a C pointer in unsafe code.
+type Handler struct { cb func(int) int }
+
+func twice(x int) int { return x * 2 }
+
+func main() {
+    h := Handler{cb: twice}
+    unsafe {
+        p := &h
+        println(p.cb(21))
+        f := p.cb
+        println(f(4))
+    }
+}
+// expect: 42
+// expect: 8

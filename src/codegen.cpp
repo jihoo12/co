@@ -913,7 +913,9 @@ private:
         std::vector<llvm::Value *> args;
         for (size_t i = 1; i < rv.ops.size(); i++)
           args.push_back(operand(rv.ops[i]));
-        llvm::CallInst *call = b_.CreateCall(funcType(ft), operand(rv.ops[0]), args);
+        llvm::Value *callee = operand(rv.ops[0]);
+        panicIf(b_.CreateIsNull(callee), "call of nil function");
+        llvm::CallInst *call = b_.CreateCall(funcType(ft), callee, args);
         for (size_t i = 0; i < ft->params.size(); i++)
           if (auto a = extAttr(ft->params[i]); a != llvm::Attribute::None)
             call->addParamAttr((unsigned)i, a);
