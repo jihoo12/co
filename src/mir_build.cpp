@@ -48,6 +48,8 @@ public:
     f_.numParams = (int)params.size();
 
     lowerBlock(*fd_.body);
+    if (returnsOkVoid())
+      assignOkVoid(fd_.body->endLoc); // falling off the end of a `!` function means success
     exitScopes(0, fd_.body->endLoc);
     gotoBlock(returnBB_, fd_.body->endLoc);
     return std::move(f_);
@@ -329,18 +331,70 @@ private:
     return copyOf(Place{c, {}}, tc_.boolTy());
   }
 
+  // Assigns `ok` (no value) to the return slot of a function returning `!`.
+  void assignOkVoid(SourceLoc loc) {
+    Rvalue ok;
+    ok.kind = Rvalue::Aggregate;
+    ok.variant = 0;
+    ok.type = f_.locals[0].type;
+    assign(Place{0, {}}, std::move(ok), loc);
+  }
+  bool returnsOkVoid() const {
+    Type *r = f_.locals[0].type;
+    return r->isResult() && r->en->resultOf->kind == TypeKind::Void;
+  }
+
+  // `try x`: unwrap the value, or return the error (or none) to our caller.
+  void lowerTry(Place dest, const UnaryExpr *u) {
+    Type *ty = u->operand->type;
+    EnumInfo *en = ty->en;
+    int t = newTemp(ty, u->loc);
+    lowerInto(Place{t, {}}, u->operand.get());
+    Operand failed = isVariant(discriminant(Place{t, {}}, u->loc), en->failVariant(), u->loc);
+    int failBB = newBlock(), okBB = newBlock();
+    branch(failed, failBB, okBB, u->loc);
+
+    cur_ = failBB;
+    Type *retTy = f_.locals[0].type;
+    Rvalue out;
+    out.kind = Rvalue::Aggregate;
+    out.type = retTy;
+    out.variant = retTy->en->failVariant();
+    if (en->resultOf) {
+      Operand e;
+      e.kind = Operand::Move; // taking the error consumes the temporary
+      e.place = Place{t, {}}.withProj({Proj::VariantField, 0, -1, 1});
+      e.type = tc_.errorTy();
+      out.ops.push_back(e);
+    }
+    assign(Place{0, {}}, std::move(out), u->loc);
+    exitScopes(0, u->loc);
+    gotoBlock(returnBB_, u->loc);
+
+    cur_ = okBB;
+    Type *vt = en->valueType();
+    if (vt->kind != TypeKind::Void) {
+      Operand v;
+      v.kind = vt->isCopy() ? Operand::Copy : Operand::Move;
+      v.place = Place{t, {}}.withProj({Proj::VariantField, 0, -1, en->valueVariant()});
+      v.type = vt;
+      assign(dest, use(v), u->loc);
+    }
+  }
+
   // `opt or fallback`
   void lowerOrElse(Place dest, const BinaryExpr *b) {
     Type *optTy = b->lhs->type->derefAll();
-    Type *inner = optTy->en->optionalOf;
+    Type *inner = optTy->en->valueType();
+    int valueV = optTy->en->valueVariant();
     if (b->orBorrows || b->lhs->type->isRef()) {
       // Look into the optional in place.
       Place p = enumPlace(b->lhs.get());
-      Operand c = isVariant(discriminant(p, b->loc), 1, b->loc);
+      Operand c = isVariant(discriminant(p, b->loc), valueV, b->loc);
       int someBB = newBlock(), noneBB = newBlock(), join = newBlock();
       branch(c, someBB, noneBB, b->loc);
       cur_ = someBB;
-      Place payload = p.withProj({Proj::VariantField, 0, -1, 1});
+      Place payload = p.withProj({Proj::VariantField, 0, -1, valueV});
       if (b->orBorrows && !inner->isRef()) {
         Rvalue ref;
         ref.kind = Rvalue::Ref;
@@ -359,7 +413,7 @@ private:
     }
     int t = newTemp(optTy, b->loc);
     lowerInto(Place{t, {}}, b->lhs.get());
-    Operand c = isVariant(discriminant(Place{t, {}}, b->loc), 1, b->loc);
+    Operand c = isVariant(discriminant(Place{t, {}}, b->loc), valueV, b->loc);
     int someBB = newBlock(), noneBB = newBlock(), join = newBlock();
     branch(c, someBB, noneBB, b->loc);
     cur_ = someBB;
@@ -371,7 +425,7 @@ private:
     } else {
       // Taking the payload consumes the whole temporary.
       val.kind = inner->isCopy() ? Operand::Copy : Operand::Move;
-      val.place = Place{t, {}}.withProj({Proj::VariantField, 0, -1, 1});
+      val.place = Place{t, {}}.withProj({Proj::VariantField, 0, -1, valueV});
       val.type = inner;
     }
     assign(dest, use(val), b->loc);
@@ -456,6 +510,9 @@ private:
         rv.place = placeOrTemp(u->operand.get());
         rv.place.proj.push_back({Proj::Deref});
         break;
+      case UnOp::Try:
+        lowerTry(dest, u);
+        return;
       }
       assign(dest, std::move(rv), loc);
       return;
@@ -579,6 +636,7 @@ private:
       case Builtin::ToFloat: rv.builtin = BuiltinOp::ToFloat; break;
       case Builtin::ToStr: rv.builtin = BuiltinOp::ToStr; break;
       case Builtin::Panic: rv.builtin = BuiltinOp::Panic; break;
+      case Builtin::MakeError: rv.builtin = BuiltinOp::MakeError; break;
       case Builtin::None: break;
       }
       for (auto &a : c->args)
@@ -700,6 +758,8 @@ private:
       auto &rs = static_cast<const ReturnStmt &>(s);
       if (rs.value)
         lowerInto(Place{0, {}}, rs.value.get());
+      else if (returnsOkVoid())
+        assignOkVoid(rs.loc);
       exitScopes(0, rs.loc);
       gotoBlock(returnBB_, rs.loc);
       cur_ = newBlock();

@@ -42,6 +42,30 @@ public:
       declare(f.info);
     for (auto &f : m.funcs)
       emitFunction(f);
+    for (auto &f : m.funcs)
+      if (f.info->symbol == "co.main")
+        emitMainWrapper(f.info);
+  }
+
+  // `func main() !`: the runtime calls co_main, which reports a returned error.
+  void emitMainWrapper(FuncInfo *info) {
+    auto *fn = llvm::Function::Create(llvm::FunctionType::get(void_, {}, false), llvm::Function::ExternalLinkage,
+                                      "co_main", mod_);
+    llvm::IRBuilder<> ib(llvm::BasicBlock::Create(ctx_, "entry", fn));
+    llvm::Type *rt_ = lt(info->ret);
+    llvm::Value *res = ib.CreateCall(fns_.at(info), {});
+    llvm::Value *slot = ib.CreateAlloca(rt_);
+    ib.CreateStore(res, slot);
+    auto *fail = llvm::BasicBlock::Create(ctx_, "failed", fn);
+    auto *done = llvm::BasicBlock::Create(ctx_, "done", fn);
+    llvm::Value *tag = ib.CreateLoad(i64_, ib.CreateStructGEP(rt_, slot, 0));
+    ib.CreateCondBr(ib.CreateICmpEQ(tag, llvm::ConstantInt::get(i64_, 1)), fail, done);
+    ib.SetInsertPoint(fail);
+    llvm::Value *payload = ib.CreateStructGEP(rt_, slot, 1);
+    ib.CreateCall(rt("co_main_failed", void_, {ptrTy_}), {ib.CreateStructGEP(variantTy(info->ret, 1), payload, 0)});
+    ib.CreateUnreachable();
+    ib.SetInsertPoint(done);
+    ib.CreateRetVoid();
   }
 
 private:
@@ -74,6 +98,7 @@ private:
     case TypeKind::Float: return f64_;
     case TypeKind::Bool: return i1_;
     case TypeKind::String:
+    case TypeKind::Error:
     case TypeKind::Slice: return vecTy_;
     case TypeKind::Ref: return ptrTy_;
     case TypeKind::None: return i64_;
@@ -175,6 +200,7 @@ private:
     llvm::Value *p = fn->getArg(0);
     switch (t->kind) {
     case TypeKind::String:
+    case TypeKind::Error:
     case TypeKind::Slice: {
       llvm::Value *data = ib.CreateLoad(ptrTy_, ib.CreateStructGEP(vecTy_, p, 0));
       if (t->kind == TypeKind::Slice && t->inner->needsDrop()) {
@@ -250,7 +276,8 @@ private:
     case TypeKind::Bool:
       ib.CreateCall(rt("co_print_bool", void_, {i32_}), {ib.CreateZExt(ib.CreateLoad(i1_, p), i32_)});
       break;
-    case TypeKind::String: ib.CreateCall(rt("co_print_str", void_, {ptrTy_}), {p}); break;
+    case TypeKind::String:
+    case TypeKind::Error: ib.CreateCall(rt("co_print_str", void_, {ptrTy_}), {p}); break;
     case TypeKind::Ref: ib.CreateCall(printFn(t->inner), {ib.CreateLoad(ptrTy_, p)}); break;
     case TypeKind::Slice: {
       text("[");
@@ -315,7 +342,7 @@ private:
     llvm::Value *dst = fn->getArg(0), *src = fn->getArg(1);
     if (t->isCopy()) {
       ib.CreateStore(ib.CreateLoad(lt(t), src), dst);
-    } else if (t->kind == TypeKind::String) {
+    } else if (t->kind == TypeKind::String || t->kind == TypeKind::Error) {
       ib.CreateCall(rt("co_str_clone", void_, {ptrTy_, ptrTy_}), {dst, src});
     } else if (t->kind == TypeKind::Slice) {
       ib.CreateCall(rt("co_vec_clone_bits", void_, {ptrTy_, ptrTy_, i64_}), {dst, src, sizeOf(t->inner)});
@@ -638,8 +665,11 @@ private:
       return rv.ops[0].type->kind == TypeKind::Float ? b_.CreateFPToSI(a[0], i64_) : a[0];
     case BuiltinOp::ToFloat:
       return rv.ops[0].type->kind == TypeKind::Int ? b_.CreateSIToFP(a[0], f64_) : a[0];
+    case BuiltinOp::MakeError:
+      return viaOut("co_str_clone", {ptrTy_}, {a[0]});
     case BuiltinOp::ToStr:
-      switch (rv.ops[0].type->kind) {
+      switch (rv.ops[0].type->derefAll()->kind) {
+      case TypeKind::Error: return viaOut("co_str_clone", {ptrTy_}, {a[0]});
       case TypeKind::Int: return viaOut("co_str_from_int", {i64_}, {a[0]});
       case TypeKind::Float: return viaOut("co_str_from_float", {f64_}, {a[0]});
       default: return viaOut("co_str_from_bool", {i32_}, {b_.CreateZExt(a[0], i32_)});

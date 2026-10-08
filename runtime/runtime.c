@@ -25,6 +25,13 @@ _Noreturn void co_panic_str(const CoVec *s) {
   exit(101);
 }
 
+// An error returned from `func main() !`.
+_Noreturn void co_main_failed(const CoVec *err) {
+  fflush(stdout);
+  fprintf(stderr, "error: %.*s\n", (int)err->len, err->ptr ? err->ptr : "");
+  exit(1);
+}
+
 _Noreturn void co_panic_bounds(int64_t idx, int64_t len) {
   fflush(stdout);
   fprintf(stderr, "panic: index out of range [%" PRId64 "] with length %" PRId64 "\n", idx, len);

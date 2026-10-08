@@ -11,6 +11,7 @@ const std::unordered_map<std::string, Builtin> kBuiltins = {
     {"print", Builtin::Print},   {"println", Builtin::Println}, {"len", Builtin::Len},
     {"append", Builtin::Append}, {"clone", Builtin::Clone},     {"int", Builtin::ToInt},
     {"float", Builtin::ToFloat}, {"str", Builtin::ToStr},       {"panic", Builtin::Panic},
+    {"error", Builtin::MakeError},
 };
 
 bool isPlace(const Expr *e) {
@@ -45,6 +46,12 @@ std::string exprStr(const Expr *e) {
   default:
     return "expression";
   }
+}
+
+// Strings and errors (a message) can be joined with `+`.
+bool textual(Type *t) {
+  TypeKind k = t->derefAll()->kind;
+  return k == TypeKind::String || k == TypeKind::Error;
 }
 
 bool samePlace(const Expr *a, const Expr *b) {
@@ -107,6 +114,7 @@ private:
       if (t.name == "float") return tc_.floatTy();
       if (t.name == "bool") return tc_.boolTy();
       if (t.name == "string") return tc_.stringTy();
+      if (t.name == "error") return tc_.errorTy();
       auto it = structs_.find(t.name);
       if (it != structs_.end())
         return tc_.structTy(it->second);
@@ -121,6 +129,12 @@ private:
       if (!inner)
         return nullptr;
       return tc_.optional(inner);
+    }
+    case TypeExpr::Result: {
+      Type *inner = t.inner ? resolveType(*t.inner) : tc_.voidTy();
+      if (!inner)
+        return nullptr;
+      return tc_.result(inner);
     }
     case TypeExpr::Ref: {
       Type *inner = resolveType(*t.inner);
@@ -148,7 +162,7 @@ private:
 
   bool typeNameTaken(const std::string &n) {
     return structs_.count(n) || enums_.count(n) || n == "int" || n == "float" || n == "bool" ||
-           n == "string";
+           n == "string" || n == "error";
   }
 
   void declareStructs() {
@@ -274,7 +288,7 @@ private:
     visitType = [&](Type *t) -> bool {
       switch (t->kind) {
       case TypeKind::Struct: return visitStruct(t->st);
-      case TypeKind::Enum: return t->en->optionalOf ? visitType(t->en->optionalOf) : visitEnum(t->en);
+      case TypeKind::Enum: return t->en->valueType() ? visitType(t->en->valueType()) : visitEnum(t->en);
       default: return true; // slices and references add indirection
       }
     };
@@ -357,9 +371,11 @@ private:
           continue;
         }
         if (fd->name == "main") {
-          info->symbol = "co_main";
-          if (!info->params.empty() || info->ret->kind != TypeKind::Void)
-            error(fd->loc, "func main must take no parameters and return nothing");
+          // `func main() !` is allowed: an error returned from main is printed.
+          bool fails = info->ret == tc_.result(tc_.voidTy());
+          info->symbol = fails ? "co.main" : "co_main";
+          if (!info->params.empty() || (info->ret->kind != TypeKind::Void && !fails))
+            error(fd->loc, "func main must take no parameters and return nothing (or '!' to allow errors)");
         } else {
           info->symbol = "co." + fd->name;
         }
@@ -461,15 +477,24 @@ private:
     }
     case StmtKind::Expr: {
       auto &es = static_cast<ExprStmt &>(s);
+      if (es.expr->kind == ExprKind::Unary && static_cast<UnaryExpr *>(es.expr.get())->op == UnOp::Try) {
+        check(es.expr);
+        break;
+      }
       if (es.expr->kind != ExprKind::Call) {
         check(es.expr);
         error(es.expr->loc, "expression is not used (only calls can be statements)");
         break;
       }
       check(es.expr);
+      if (es.expr->kind != ExprKind::Call)
+        break;
       auto *call = static_cast<CallExpr *>(es.expr.get());
       if (call->builtin == Builtin::Append)
         error(call->loc, "result of append must be assigned: write 'v = append(v, x)'");
+      if (call->type && call->type->isResult() && call->func)
+        error(call->loc, "the error from '" + call->func->name + "' is ignored; write 'try " + call->func->name +
+                             "(...)' to pass it on, or handle it with 'or' or a switch");
       break;
     }
     case StmtKind::Assign:
@@ -552,6 +577,7 @@ private:
     case StmtKind::Return: {
       auto &rs = static_cast<ReturnStmt &>(s);
       Type *ret = fn_->info->ret;
+      bool okIfEmpty = ret->isResult() && ret->en->resultOf->kind == TypeKind::Void;
       if (rs.value) {
         Type *t = check(rs.value);
         if (ret->kind == TypeKind::Void) {
@@ -559,7 +585,7 @@ private:
         } else if (t) {
           coerce(rs.value, ret);
         }
-      } else if (ret->kind != TypeKind::Void) {
+      } else if (ret->kind != TypeKind::Void && !okIfEmpty) {
         error(rs.loc, "missing return value of type '" + ret->str() + "'");
       }
       break;
@@ -878,6 +904,22 @@ private:
     Type *t = e->type;
     if (!t || !target)
       return false;
+    if (target->isResult() && t != target) {
+      int vi = 0;
+      if (t->kind == TypeKind::Error) {
+        vi = 1;
+      } else if (target->en->resultOf->kind == TypeKind::Void) {
+        error(e->loc, "expected an error here, found '" + t->str() + "' (this function returns only '!')");
+        return false;
+      } else if (!coerce(e, target->en->resultOf, isArg)) {
+        return false;
+      }
+      SourceLoc l = e->loc;
+      std::vector<ExprPtr> args;
+      args.push_back(std::move(e));
+      e = makeVariant(l, target, vi, std::move(args));
+      return true;
+    }
     if (target->isOptional() && t != target) {
       if (t->kind == TypeKind::None) {
         e = makeVariant(e->loc, target, 0, {});
@@ -915,6 +957,8 @@ private:
       hint = " ('none' can only be used where an optional '?T' is expected)";
     else if (t->isOptional() && t->en->optionalOf == target)
       hint = " (the value may be missing: use 'x or default', or a switch with 'case some(v)')";
+    else if (t->isResult() && t->en->resultOf == target)
+      hint = " (this may be an error: use 'try x' to pass it on, 'x or default', or a switch with 'case ok(v)')";
     else if (target->isRef() && !t->isRef() && target->inner == t)
       hint = std::string(" (add '") + (target->mut ? "&mut" : "&") + "' to pass a reference)";
     else if (t->isRef() && !target->isRef() && t->inner == target)
@@ -1092,6 +1136,30 @@ private:
     case UnOp::ReborrowShared:
     case UnOp::ReborrowMut:
       return u.type;
+    case UnOp::Try: {
+      Type *ret = fn_->info->ret;
+      std::string fname = fn_->name == "main" ? "main" : fn_->name;
+      if (t->isResult()) {
+        if (!ret->isResult()) {
+          std::string want = ret->kind == TypeKind::Void ? "!" : "!" + ret->str();
+          std::string sig = fname == "main" ? "func main() !" : "func " + fname + "(...) " + want;
+          error(u.loc, "'try' passes errors to the caller, but '" + fname + "' can't return errors; declare it as '" +
+                           sig + "'");
+          return nullptr;
+        }
+        return t->en->resultOf;
+      }
+      if (t->isOptional()) {
+        if (!ret->isOptional()) {
+          error(u.loc, "'try' on an optional returns 'none' from '" + fname +
+                           "', so it must return an optional '?T'; use 'x or default' instead");
+          return nullptr;
+        }
+        return t->en->optionalOf;
+      }
+      error(u.loc, "'try' needs a value that may fail (!T) or be missing (?T), found '" + t->str() + "'");
+      return nullptr;
+    }
     }
     return nullptr;
   }
@@ -1107,11 +1175,16 @@ private:
     };
     if (b.op == BinOp::OrElse) {
       Type *opt = lt->derefAll();
-      if (!opt->isOptional()) {
-        error(b.loc, "'or' needs an optional value (?T) on its left, found '" + lt->str() + "'");
+      if (!opt->isOptional() && !opt->isResult()) {
+        error(b.loc, "'or' needs a value that may be missing (?T) or fail (!T) on its left, found '" +
+                         lt->str() + "'");
         return nullptr;
       }
-      Type *inner = opt->en->optionalOf;
+      Type *inner = opt->en->valueType();
+      if (inner->kind == TypeKind::Void) {
+        error(b.loc, "'or' needs a value, but '" + lt->str() + "' has none; use 'try' or a switch");
+        return nullptr;
+      }
       // Like switch, `or` on a variable (or through a reference) only looks:
       // owned payloads come out borrowed.
       if (!inner->isCopy() && (lt->isRef() || isPlace(b.lhs.get()))) {
@@ -1165,8 +1238,8 @@ private:
     case BinOp::Mul:
     case BinOp::Div:
     case BinOp::Rem:
-      if (b.op == BinOp::Add && lt->derefAll()->kind == TypeKind::String &&
-          rt->derefAll()->kind == TypeKind::String) {
+      if (b.op == BinOp::Add && textual(lt) && textual(rt) &&
+          (lt->derefAll()->kind == TypeKind::String || rt->derefAll()->kind == TypeKind::String)) {
         // String concatenation borrows both sides and produces a new string.
         autoRefShared(b.lhs);
         autoRefShared(b.rhs);
@@ -1485,12 +1558,30 @@ private:
     case Builtin::ToStr: {
       if (!argCount(c, "str", 1))
         return nullptr;
-      TypeKind k = c.args[0]->type->kind;
+      TypeKind k = c.args[0]->type->derefAll()->kind;
+      if (k == TypeKind::Error) {
+        autoRefShared(c.args[0]);
+        return tc_.stringTy(); // the error's message
+      }
+      if (c.args[0]->type->isRef()) {
+        error(c.args[0]->loc, "str() needs a value; use '*x'");
+        return nullptr;
+      }
       if (k != TypeKind::Int && k != TypeKind::Float && k != TypeKind::Bool) {
-        error(c.args[0]->loc, "str() converts int, float or bool, found '" + c.args[0]->type->str() + "'");
+        error(c.args[0]->loc, "str() converts int, float, bool or error, found '" + c.args[0]->type->str() + "'");
         return nullptr;
       }
       return tc_.stringTy();
+    }
+    case Builtin::MakeError: {
+      if (!argCount(c, "error", 1))
+        return nullptr;
+      if (c.args[0]->type->derefAll()->kind != TypeKind::String) {
+        error(c.args[0]->loc, "error(...) needs a message string; use str(x) to convert");
+        return nullptr;
+      }
+      autoRefShared(c.args[0]);
+      return tc_.errorTy();
     }
     case Builtin::Panic: {
       if (!argCount(c, "panic", 1))

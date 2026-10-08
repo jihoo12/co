@@ -113,6 +113,12 @@ private:
       t->inner = parseType();
       return t;
     }
+    if (accept(Tok::Not)) {
+      t->kind = TypeExpr::Result;
+      if (!at(Tok::LBrace) && !at(Tok::RParen) && !at(Tok::Comma) && !at(Tok::Semi))
+        t->inner = parseType(); // a bare `!` means "nothing, or an error"
+      return t;
+    }
     if (accept(Tok::LBracket)) {
       expect(Tok::RBracket, "in slice type");
       t->kind = TypeExpr::Slice;
@@ -549,6 +555,8 @@ private:
       return std::make_unique<UnaryExpr>(l, UnOp::Neg, parseUnary());
     if (accept(Tok::Not))
       return std::make_unique<UnaryExpr>(l, UnOp::Not, parseUnary());
+    if (accept(Tok::KwTry))
+      return std::make_unique<UnaryExpr>(l, UnOp::Try, parseUnary());
     if (accept(Tok::Star))
       return std::make_unique<UnaryExpr>(l, UnOp::Deref, parseUnary());
     if (accept(Tok::Amp)) {

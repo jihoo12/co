@@ -97,6 +97,7 @@ static const char *builtinStr(BuiltinOp b) {
   case BuiltinOp::StrLit: return "str_lit";
   case BuiltinOp::StrConcat: return "str_concat";
   case BuiltinOp::StrCmp: return "str_cmp";
+  case BuiltinOp::MakeError: return "error";
   }
   return "?";
 }

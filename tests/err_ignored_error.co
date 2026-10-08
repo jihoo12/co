@@ -1,0 +1,5 @@
+// error: the error from 'save' is ignored; write 'try save(...)'
+func save() ! { return error("x") }
+func main() {
+    save()
+}

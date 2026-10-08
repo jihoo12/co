@@ -1,0 +1,7 @@
+// error: 'try' passes errors to the caller, but 'main' can't return errors; declare it as 'func main() !'
+// error: (this may be an error: use 'try x' to pass it on
+func get() !int { return 1 }
+func main() {
+    x := try get()
+    var y int = get()
+}

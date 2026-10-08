@@ -13,7 +13,7 @@ namespace co {
 // ----- Type syntax -----
 
 struct TypeExpr {
-  enum Kind { Name, Ref, Slice, Optional } kind = Name;
+  enum Kind { Name, Ref, Slice, Optional, Result } kind = Name; // Result: `!T`, or `!` (inner null)
   std::string name;  // Name
   bool mut = false;  // Ref
   std::unique_ptr<TypeExpr> inner;
@@ -43,12 +43,13 @@ enum class UnOp {
   // Inserted by sema: re-borrow through an existing reference (`&*r` / `&mut *r`).
   ReborrowShared,
   ReborrowMut,
+  Try, // `try x`: unwrap, or return the error / none to the caller
 };
 
 // OrElse is `opt or default`.
 enum class BinOp { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, Gt, Ge, And, Or, OrElse };
 
-enum class Builtin { None, Print, Println, Len, Append, Clone, ToInt, ToFloat, ToStr, Panic };
+enum class Builtin { None, Print, Println, Len, Append, Clone, ToInt, ToFloat, ToStr, Panic, MakeError };
 
 struct Expr {
   ExprKind kind;

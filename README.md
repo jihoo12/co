@@ -91,10 +91,10 @@ func add(a, b int) int { return a + b }
 ```
 
 Types: `int` (64-bit), `float` (64-bit), `bool`, `string`, slices `[]T`, structs, enums, optionals `?T`,
-and references `&T` / `&mut T`.
+results `!T`, `error`, and references `&T` / `&mut T`.
 
 Builtins: `println(...)`, `print(...)`, `len(x)`, `append(v, x)`, `clone(x)`, `str(x)`, `int(x)`,
-`float(x)`, `panic(msg)`. `println` can print anything, including structs, slices, enums and optionals.
+`float(x)`, `error(msg)`, `panic(msg)`. `println` can print anything, including structs, slices, enums and optionals.
 
 ## Structs and methods
 
@@ -184,6 +184,43 @@ case none:    println("missing")
 ```
 
 Struct fields can be optional too (`email ?string`), and they start as `none`.
+
+## Errors
+
+A function that can fail returns `!T`: "a `T`, or an error". There is one built-in `error` type that
+holds a message, so you never define error types.
+
+```go
+func parsePort(text &string) !int {
+    if text == "8080" { return 8080 }          // success is wrapped automatically
+    return error("not a port: " + text)        // failure
+}
+
+func load(path &string) !Config {
+    port := try parsePort(path)                // on error, return it to my caller
+    return Config{port: port}
+}
+
+func save(c &Config) ! {                       // `!` alone: nothing, or an error
+    if c.port == 0 { return error("no port") }
+}                                              // reaching the end means success
+```
+
+Three ways to deal with an error, from shortest to most explicit:
+
+```go
+p := try parsePort(s)            // pass it on (the function must return !something)
+p := parsePort(s) or 80          // use a default
+switch parsePort(s) {            // handle both
+case ok(p):  println("port", p)
+case err(e): println("bad input:", e)
+}
+```
+
+Errors can't be ignored by accident: calling a `!` function without `try`, `or` or `switch` is a
+compile error. `func main() !` may use `try`, and an error that reaches it is printed as
+`error: ...` with exit status 1, which is handy for scripts. `try` also works on optionals inside a
+function returning `?T`, where it passes `none` on. Add context with `+`: `error("loading config: " + e)`.
 
 ---
 
@@ -291,5 +328,4 @@ any access that conflicts with one.
 
 ## Not yet supported
 
-Generics, interfaces, closures, maps, modules/imports, string indexing, error values with `?`-style
-propagation, references inside structs.
+Generics, interfaces, closures, maps, modules/imports, string indexing, references inside structs.

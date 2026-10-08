@@ -1,0 +1,8 @@
+// expect: done
+func check(n int) ! {
+    if n < 0 { return error("negative") }
+}
+func main() ! {
+    try check(5)
+    println("done")
+}

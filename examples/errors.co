@@ -1,0 +1,39 @@
+// Error handling: `!T` means "a T, or an error".
+
+type Config struct {
+    name  string
+    port  int
+    debug bool
+}
+
+func parsePort(text &string) !int {
+    switch text {
+    case "80":   return 80
+    case "8080": return 8080
+    }
+    return error("not a port: " + text)
+}
+
+func load(name &string, port &string) !Config {
+    if len(name) == 0 {
+        return error("config needs a name")
+    }
+    p := try parsePort(port)       // on error, return it from load()
+    return Config{name: clone(name), port: p}
+}
+
+func main() ! {
+    // 1. handle both outcomes
+    switch load("web", "8080") {
+    case ok(cfg): println("loaded", cfg)
+    case err(e):  println("could not load:", e)
+    }
+
+    // 2. fall back to a default
+    port := parsePort("abc") or 80
+    println("port", port)
+
+    // 3. pass it on: main prints the error and exits with status 1
+    cfg := try load("", "80")
+    println("unreachable", cfg)
+}

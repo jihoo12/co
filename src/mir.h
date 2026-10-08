@@ -64,6 +64,7 @@ enum class BuiltinOp {
   StrLit,    // creates an owned string from `strLit`
   StrConcat, // (&string, &string) -> string
   StrCmp,    // (&string, &string) -> bool using `cmp`
+  MakeError, // error(&string) -> error
 };
 
 struct Rvalue {

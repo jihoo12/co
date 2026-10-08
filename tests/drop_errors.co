@@ -1,0 +1,23 @@
+// expect: 50 50
+func work(i int) !string {
+    if i % 2 == 0 { return error("even " + str(i)) }
+    return "odd " + str(i)
+}
+func twice(i int) !string {
+    s := try work(i)
+    return s + "!"
+}
+func main() {
+    oks := 0
+    errs := 0
+    for i := range 100 {
+        switch twice(i) {
+        case ok(s): oks += len(s) - len(s) + 1
+        case err(e): errs++
+        }
+        r := work(i)
+        r2 := clone(r)
+        r = r2
+    }
+    println(oks, errs)
+}

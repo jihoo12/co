@@ -1,6 +1,6 @@
 // error: cannot tell the type of 'none' here
 // error: (the value may be missing: use 'x or default', or a switch with 'case some(v)')
-// error: 'or' needs an optional value
+// error: 'or' needs a value that may be missing (?T) or fail (!T)
 func get() ?int { return 1 }
 func main() {
     x := none

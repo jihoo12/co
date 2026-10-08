@@ -14,8 +14,9 @@ struct EnumInfo;
 struct FuncInfo;
 
 // `None` is the type of the `none` literal before it is converted to some `?T`.
-// Optionals `?T` are enums with variants `none` and `some(T)`.
-enum class TypeKind { Void, Int, Float, Bool, String, Struct, Enum, Ref, Slice, None };
+// Optionals `?T` are enums with variants `none` and `some(T)`; results `!T`
+// are enums with variants `ok(T)` and `err(error)`. `error` holds a message.
+enum class TypeKind { Void, Int, Float, Bool, String, Error, Struct, Enum, Ref, Slice, None };
 
 // Types are interned by TypeContext, so they can be compared by pointer.
 struct Type {
@@ -34,6 +35,7 @@ struct Type {
   bool needsDrop() const;
   std::string str() const;
   bool isOptional() const;
+  bool isResult() const;
   // References, possibly nested in optionals or slices.
   bool containsRef() const;
   // Strips one level of reference, if any.
@@ -69,6 +71,12 @@ struct EnumInfo {
   bool needsDrop = false;
   bool isCopy = true;
   Type *optionalOf = nullptr; // set for `?T`: variants are none (0) and some(T) (1)
+  Type *resultOf = nullptr;   // set for `!T`: variants are ok(T) (0) and err(error) (1); T may be void
+
+  // For `?T` / `!T`: the variant holding the value, and the one meaning "no value".
+  int valueVariant() const { return optionalOf ? 1 : 0; }
+  int failVariant() const { return optionalOf ? 0 : 1; }
+  Type *valueType() const { return optionalOf ? optionalOf : resultOf; }
 };
 
 class TypeContext {
@@ -85,14 +93,16 @@ public:
   Type *enumTy(EnumInfo *en);
   Type *optional(Type *inner);
   Type *noneTy() { return &none_; }
+  Type *errorTy() { return &error_; }
+  Type *result(Type *inner);
 
 private:
-  Type void_, int_, float_, bool_, string_, none_;
+  Type void_, int_, float_, bool_, string_, none_, error_;
   std::map<std::pair<Type *, bool>, std::unique_ptr<Type>> refs_;
   std::map<Type *, std::unique_ptr<Type>> slices_;
   std::map<StructInfo *, std::unique_ptr<Type>> structs_;
   std::map<EnumInfo *, std::unique_ptr<Type>> enums_;
-  std::map<Type *, std::unique_ptr<EnumInfo>> optionals_;
+  std::map<Type *, std::unique_ptr<EnumInfo>> optionals_, results_;
 };
 
 } // namespace co

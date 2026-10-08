@@ -1,0 +1,11 @@
+// exit: 1
+// expect: step 1
+// stderr: error: config missing: settings.txt
+func readConfig(path &string) !string {
+    return error("config missing: " + path)
+}
+func main() ! {
+    println("step 1")
+    cfg := try readConfig("settings.txt")
+    println("never", cfg)
+}
