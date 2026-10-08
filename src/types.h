@@ -16,13 +16,14 @@ struct FuncInfo;
 // `None` is the type of the `none` literal before it is converted to some `?T`.
 // Optionals `?T` are enums with variants `none` and `some(T)`; results `!T`
 // are enums with variants `ok(T)` and `err(error)`. `error` holds a message.
-enum class TypeKind { Void, Int, Float, Bool, String, Error, Struct, Enum, Ref, Slice, None };
+enum class TypeKind { Void, Int, Float, Bool, String, Error, Struct, Enum, Ref, Slice, Map, None };
 
 // Types are interned by TypeContext, so they can be compared by pointer.
 struct Type {
   TypeKind kind;
   bool mut = false;       // for Ref: &mut T
-  Type *inner = nullptr;  // for Ref and Slice
+  Type *inner = nullptr;  // for Ref and Slice; the value type of a Map
+  Type *key = nullptr;    // for Map
   StructInfo *st = nullptr;
   EnumInfo *en = nullptr;
 
@@ -89,6 +90,7 @@ public:
   Type *stringTy() { return &string_; }
   Type *ref(Type *inner, bool mut);
   Type *slice(Type *elem);
+  Type *map(Type *key, Type *value);
   Type *structTy(StructInfo *st);
   Type *enumTy(EnumInfo *en);
   Type *optional(Type *inner);
@@ -100,6 +102,7 @@ private:
   Type void_, int_, float_, bool_, string_, none_, error_;
   std::map<std::pair<Type *, bool>, std::unique_ptr<Type>> refs_;
   std::map<Type *, std::unique_ptr<Type>> slices_;
+  std::map<std::pair<Type *, Type *>, std::unique_ptr<Type>> maps_;
   std::map<StructInfo *, std::unique_ptr<Type>> structs_;
   std::map<EnumInfo *, std::unique_ptr<Type>> enums_;
   std::map<Type *, std::unique_ptr<EnumInfo>> optionals_, results_;

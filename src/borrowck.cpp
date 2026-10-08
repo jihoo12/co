@@ -365,7 +365,11 @@ private:
           loans_.push_back(loan);
         } else if (destRegion >= 0) {
           // Data flowing into a reference: the source must outlive the destination.
-          for (auto &op : rv.ops) {
+          // Builtins that return references (map lookups) borrow only from
+          // their first operand, never from the key.
+          size_t nops = rv.kind == Rvalue::Builtin ? std::min<size_t>(1, rv.ops.size()) : rv.ops.size();
+          for (size_t oi = 0; oi < nops; oi++) {
+            const Operand &op = rv.ops[oi];
             if (op.kind == Operand::Const || !op.type->containsRef())
               continue;
             int sr = localRegion_[op.place.local];

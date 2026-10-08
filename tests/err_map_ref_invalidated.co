@@ -1,0 +1,7 @@
+// error: cannot borrow 'm' as mutable because it is also borrowed as immutable
+func main() {
+    m := map[int]string{1: "one"}
+    s := m[1] or "none"         // s borrows from m
+    m[2] = "two"
+    println(s)
+}

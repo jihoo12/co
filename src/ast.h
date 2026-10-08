@@ -13,10 +13,11 @@ namespace co {
 // ----- Type syntax -----
 
 struct TypeExpr {
-  enum Kind { Name, Ref, Slice, Optional, Result } kind = Name; // Result: `!T`, or `!` (inner null)
+  enum Kind { Name, Ref, Slice, Optional, Result, Map } kind = Name; // Result: `!T`, or `!` (inner null)
   std::string name;  // Name
   bool mut = false;  // Ref
-  std::unique_ptr<TypeExpr> inner;
+  std::unique_ptr<TypeExpr> inner; // for Map: the value type
+  std::unique_ptr<TypeExpr> key;   // Map
   SourceLoc loc;
 };
 using TypeExprPtr = std::unique_ptr<TypeExpr>;
@@ -31,7 +32,8 @@ struct LocalVar {
 // ----- Expressions -----
 
 enum class ExprKind {
-  IntLit, FloatLit, StrLit, BoolLit, NoneLit, Ident, Unary, Binary, Call, Field, Index, StructLit, SliceLit, EnumLit
+  IntLit, FloatLit, StrLit, BoolLit, NoneLit, Ident, Unary, Binary, Call, Field, Index, StructLit, SliceLit, EnumLit,
+  MapLit
 };
 
 enum class UnOp {
@@ -49,7 +51,7 @@ enum class UnOp {
 // OrElse is `opt or default`.
 enum class BinOp { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, Gt, Ge, And, Or, OrElse };
 
-enum class Builtin { None, Print, Println, Len, Append, Clone, ToInt, ToFloat, ToStr, Panic, MakeError };
+enum class Builtin { None, Print, Println, Len, Append, Clone, ToInt, ToFloat, ToStr, Panic, MakeError, Delete };
 
 struct Expr {
   ExprKind kind;
@@ -117,6 +119,10 @@ struct FieldExpr : Expr {
 struct IndexExpr : Expr {
   ExprPtr base, index;
   bool autoDeref = false;
+  // On maps: `m[k]` read gives an optional (MapRead); as an assignment
+  // target it is the entry itself, inserted if missing (MapWrite).
+  enum Mode { Slice, MapRead, MapWrite } mode = Slice;
+  bool writeTarget = false; // set before checking: this is on the left of `=`
   IndexExpr(SourceLoc l, ExprPtr b, ExprPtr i)
       : Expr(ExprKind::Index, l), base(std::move(b)), index(std::move(i)) {}
 };
@@ -131,6 +137,11 @@ struct StructLitExpr : Expr {
   std::vector<FieldInit> fields;
   StructInfo *st = nullptr;
   StructLitExpr(SourceLoc l, std::string n) : Expr(ExprKind::StructLit, l), name(std::move(n)) {}
+};
+struct MapLitExpr : Expr {
+  TypeExprPtr mapType;
+  std::vector<std::pair<ExprPtr, ExprPtr>> entries;
+  MapLitExpr(SourceLoc l, TypeExprPtr t) : Expr(ExprKind::MapLit, l), mapType(std::move(t)) {}
 };
 struct SliceLitExpr : Expr {
   TypeExprPtr elemType;
@@ -211,7 +222,9 @@ struct ForRangeStmt : Stmt {
   LocalVar *var = nullptr;
   LocalVar *valueVar = nullptr;
   bool overSlice = false;
+  bool overMap = false;    // `for k, v := range m`: keys in insertion order
   bool valueByRef = false; // elements that aren't copyable are borrowed
+  bool keyByRef = false;   // map keys that aren't copyable are borrowed
   explicit ForRangeStmt(SourceLoc l) : Stmt(StmtKind::ForRange, l) {}
 };
 struct SwitchCase {

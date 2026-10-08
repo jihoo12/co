@@ -1,0 +1,55 @@
+// expect: {ann: 30, bob: 25}
+// expect: 30 0
+// expect: 3 {ann: 31, bob: 25, cat: 7}
+// expect: true false
+// expect: {ann: 31, cat: 7} 2
+// expect: ann=31 cat=7
+// expect: {the: 3, cat: 2, sat: 1}
+// expect: {a: [1, 3], b: [2]}
+// expect: unknown hello
+// expect: {1: true, 2: false}
+// expect: Stats{hits: {x: 2}}
+type Stats struct { hits map[string]int }
+func main() {
+    ages := map[string]int{"ann": 30, "bob": 25}
+    println(ages)
+    println(ages["ann"] or 0, ages["zed"] or 0)
+    ages["cat"] = 7
+    ages["ann"]++
+    println(len(ages), ages)
+    println(ages["bob"] != none, ages["zed"] != none)
+    delete(ages, "bob")
+    delete(ages, "nobody")
+    println(ages, len(ages))
+    line := ""
+    for name, age := range ages {
+        if line != "" { line += " " }
+        line += name + "=" + str(age)
+    }
+    println(line)
+
+    counts := map[string]int{}
+    for _, w := range []string{"the", "cat", "sat", "the", "cat", "the"} {
+        counts[w] += 1
+    }
+    println(counts)
+
+    groups := map[string][]int{}
+    groups["a"] = append(groups["a"], 1)
+    groups["b"] = append(groups["b"], 2)
+    groups["a"] = append(groups["a"], 3)
+    println(groups)
+
+    names := map[int]string{1: "hello"}
+    println(names[7] or "unknown", names[1] or "unknown")
+
+    var flags map[int]bool          // zero value: an empty map, ready to use
+    flags[1] = true
+    flags[2] = false
+    println(flags)
+
+    var s Stats
+    s.hits["x"]++
+    s.hits["x"]++
+    println(s)
+}

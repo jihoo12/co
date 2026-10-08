@@ -11,15 +11,16 @@ const std::unordered_map<std::string, Builtin> kBuiltins = {
     {"print", Builtin::Print},   {"println", Builtin::Println}, {"len", Builtin::Len},
     {"append", Builtin::Append}, {"clone", Builtin::Clone},     {"int", Builtin::ToInt},
     {"float", Builtin::ToFloat}, {"str", Builtin::ToStr},       {"panic", Builtin::Panic},
-    {"error", Builtin::MakeError},
+    {"error", Builtin::MakeError}, {"delete", Builtin::Delete},
 };
 
 bool isPlace(const Expr *e) {
   switch (e->kind) {
   case ExprKind::Ident:
   case ExprKind::Field:
-  case ExprKind::Index:
     return true;
+  case ExprKind::Index:
+    return static_cast<const IndexExpr *>(e)->mode != IndexExpr::MapRead;
   case ExprKind::Unary:
     return static_cast<const UnaryExpr *>(e)->op == UnOp::Deref;
   default:
@@ -54,25 +55,65 @@ bool textual(Type *t) {
   return k == TypeKind::String || k == TypeKind::Error;
 }
 
-bool samePlace(const Expr *a, const Expr *b) {
+// Do `a` and `b` spell the same simple place, like `v`, `p.items`, `m[k]`
+// or `grid[i]`? (Used to turn `x = append(x, v)` into an in-place push.)
+bool sameSyntax(const Expr *a, const Expr *b) {
   if (a->kind != b->kind)
     return false;
   switch (a->kind) {
   case ExprKind::Ident:
-    return static_cast<const IdentExpr *>(a)->var == static_cast<const IdentExpr *>(b)->var;
+    return static_cast<const IdentExpr *>(a)->name == static_cast<const IdentExpr *>(b)->name;
+  case ExprKind::IntLit:
+    return static_cast<const IntLitExpr *>(a)->value == static_cast<const IntLitExpr *>(b)->value;
+  case ExprKind::StrLit:
+    return static_cast<const StrLitExpr *>(a)->value == static_cast<const StrLitExpr *>(b)->value;
   case ExprKind::Field: {
     auto *fa = static_cast<const FieldExpr *>(a);
     auto *fb = static_cast<const FieldExpr *>(b);
-    return fa->name == fb->name && samePlace(fa->base.get(), fb->base.get());
+    return fa->name == fb->name && sameSyntax(fa->base.get(), fb->base.get());
+  }
+  case ExprKind::Index: {
+    auto *ia = static_cast<const IndexExpr *>(a);
+    auto *ib = static_cast<const IndexExpr *>(b);
+    return sameSyntax(ia->base.get(), ib->base.get()) && sameSyntax(ia->index.get(), ib->index.get());
   }
   case ExprKind::Unary: {
     auto *ua = static_cast<const UnaryExpr *>(a);
     auto *ub = static_cast<const UnaryExpr *>(b);
     return ua->op == UnOp::Deref && ub->op == UnOp::Deref &&
-           samePlace(ua->operand.get(), ub->operand.get());
+           sameSyntax(ua->operand.get(), ub->operand.get());
+  }
+  case ExprKind::Call: { // only `len(...)`, which has no side effects
+    auto *ca = static_cast<const CallExpr *>(a);
+    auto *cb = static_cast<const CallExpr *>(b);
+    return ca->callee->kind == ExprKind::Ident && cb->callee->kind == ExprKind::Ident &&
+           static_cast<const IdentExpr *>(ca->callee.get())->name == "len" &&
+           static_cast<const IdentExpr *>(cb->callee.get())->name == "len" && ca->args.size() == 1 &&
+           cb->args.size() == 1 && sameSyntax(ca->args[0].get(), cb->args[0].get());
+  }
+  case ExprKind::Binary: { // side-effect free: operands are names and literals
+    auto *ba = static_cast<const BinaryExpr *>(a);
+    auto *bb = static_cast<const BinaryExpr *>(b);
+    return ba->op == bb->op && sameSyntax(ba->lhs.get(), bb->lhs.get()) &&
+           sameSyntax(ba->rhs.get(), bb->rhs.get());
   }
   default:
     return false;
+  }
+}
+
+// Marks map indexing on the left of an assignment (`m[k] = v`, `m[k].x += 1`).
+void markWriteTarget(Expr *e) {
+  while (true) {
+    if (e->kind == ExprKind::Field) {
+      e = static_cast<FieldExpr *>(e)->base.get();
+    } else if (e->kind == ExprKind::Index) {
+      auto *ie = static_cast<IndexExpr *>(e);
+      ie->writeTarget = true;
+      e = ie->base.get();
+    } else {
+      return;
+    }
   }
 }
 
@@ -129,6 +170,21 @@ private:
       if (!inner)
         return nullptr;
       return tc_.optional(inner);
+    }
+    case TypeExpr::Map: {
+      Type *k = resolveType(*t.key);
+      Type *v = resolveType(*t.inner);
+      if (!k || !v)
+        return nullptr;
+      if (k->kind != TypeKind::Int && k->kind != TypeKind::String && k->kind != TypeKind::Bool) {
+        error(t.key->loc, "map keys must be int, string or bool, not '" + k->str() + "'");
+        return nullptr;
+      }
+      if (v->containsRef()) {
+        error(t.inner->loc, "maps cannot hold references (borrowed data can't be stored in containers)");
+        return nullptr;
+      }
+      return tc_.map(k, v);
     }
     case TypeExpr::Result: {
       Type *inner = t.inner ? resolveType(*t.inner) : tc_.voidTy();
@@ -502,6 +558,7 @@ private:
       break;
     case StmtKind::IncDec: {
       auto &st = static_cast<IncDecStmt &>(s);
+      markWriteTarget(st.target.get());
       Type *t = check(st.target);
       if (!t)
         break;
@@ -543,7 +600,16 @@ private:
       auto &fr = static_cast<ForRangeStmt &>(s);
       Type *t = check(fr.range);
       Type *elemTy = nullptr;
-      if (t && t->derefAll()->kind == TypeKind::Slice) {
+      Type *keyTy = nullptr;
+      if (t && t->derefAll()->kind == TypeKind::Map) {
+        fr.overMap = true;
+        Type *mt = t->derefAll();
+        fr.keyByRef = !mt->key->isCopy();
+        keyTy = fr.keyByRef ? tc_.ref(mt->key, false) : mt->key;
+        fr.valueByRef = !mt->inner->isCopy();
+        elemTy = fr.valueByRef ? tc_.ref(mt->inner, false) : mt->inner;
+        autoRefShared(fr.range);
+      } else if (t && t->derefAll()->kind == TypeKind::Slice) {
         fr.overSlice = true;
         Type *et = t->derefAll()->inner;
         fr.valueByRef = !et->isCopy();
@@ -555,7 +621,7 @@ private:
         error(fr.valueLoc, "range over an int gives only one value: write 'for i := range n'");
       }
       scopes_.emplace_back();
-      fr.var = newVar(fr.name, tc_.intTy(), fr.nameLoc);
+      fr.var = newVar(fr.name, keyTy ? keyTy : tc_.intTy(), fr.nameLoc);
       if (fr.name != "_")
         declare(fr.var);
       if (!fr.valueName.empty() && elemTy) {
@@ -773,6 +839,16 @@ private:
   }
 
   void checkAssign(AssignStmt &as) {
+    // `x = append(x, v)` grows x in place (also for `m[k]` and `v[i]`).
+    // Compare the spelling before checking, which rewrites expressions.
+    bool appendSelf = false;
+    if (as.op == AssignOp::Set && as.rhs->kind == ExprKind::Call) {
+      auto *call = static_cast<CallExpr *>(as.rhs.get());
+      appendSelf = call->callee->kind == ExprKind::Ident &&
+                   static_cast<IdentExpr *>(call->callee.get())->name == "append" && call->args.size() == 2 &&
+                   !lookup("append") && sameSyntax(call->args[0].get(), as.lhs.get());
+    }
+    markWriteTarget(as.lhs.get());
     Type *lt = check(as.lhs);
     if (!lt) {
       check(as.rhs);
@@ -786,16 +862,11 @@ private:
     checkMutablePlace(as.lhs.get(), "assign to");
 
     if (as.op == AssignOp::Set) {
-      if (as.rhs->kind == ExprKind::Call) {
+      if (appendSelf) {
         auto *call = static_cast<CallExpr *>(as.rhs.get());
-        if (call->callee->kind == ExprKind::Ident &&
-            static_cast<IdentExpr *>(call->callee.get())->name == "append" && call->args.size() == 2 &&
-            !lookup("append")) {
-          // Resolve the first argument to see whether it names the same place.
-          Type *t0 = check(call->args[0]);
-          if (t0 && samePlace(call->args[0].get(), as.lhs.get()))
-            as.appendInPlace = true;
-        }
+        markWriteTarget(call->args[0].get());
+        if (check(call->args[0]))
+          as.appendInPlace = true;
       }
       Type *rt = check(as.rhs);
       if (rt)
@@ -1040,6 +1111,22 @@ private:
         return nullptr;
       ie->autoDeref = bt->isRef();
       Type *st = bt->derefAll();
+      if (st->kind == TypeKind::Map) {
+        Type *kt = st->key;
+        if (kt->kind == TypeKind::String ? !textual(it) || it->derefAll()->kind != TypeKind::String
+                                         : it != kt) {
+          error(ie->index->loc, "map key must be '" + kt->str() + "', found '" + it->str() + "'");
+          return nullptr;
+        }
+        autoRefShared(ie->index); // keys are only looked at
+        if (ie->writeTarget) {
+          ie->mode = IndexExpr::MapWrite;
+          return st->inner;
+        }
+        ie->mode = IndexExpr::MapRead;
+        Type *vt = st->inner;
+        return tc_.optional(vt->isCopy() ? vt : tc_.ref(vt, false));
+      }
       if (st->kind != TypeKind::Slice) {
         error(ie->loc, "cannot index a value of type '" + bt->str() + "'");
         return nullptr;
@@ -1077,6 +1164,21 @@ private:
           coerce(f.value, sl->st->fields[f.index].type);
       }
       return tc_.structTy(sl->st);
+    }
+    case ExprKind::MapLit: {
+      auto *ml = static_cast<MapLitExpr *>(e.get());
+      Type *mt = resolveType(*ml->mapType);
+      for (auto &[k, v] : ml->entries) {
+        Type *kt = check(k);
+        Type *vt = check(v);
+        if (!mt)
+          continue;
+        if (kt && coerce(k, mt->key))
+          autoRefShared(k);
+        if (vt)
+          coerce(v, mt->inner);
+      }
+      return mt;
     }
     case ExprKind::SliceLit: {
       auto *sl = static_cast<SliceLitExpr *>(e.get());
@@ -1198,7 +1300,9 @@ private:
       }
       if (rt == lt)
         return lt;
-      if (!coerce(b.rhs, inner))
+      if (inner->isRef() && rt == inner->inner) // `names[id] or "unknown"`
+        b.rhs = wrap(std::move(b.rhs), UnOp::Ref, inner);
+      else if (!coerce(b.rhs, inner))
         return nullptr;
       return inner;
     }
@@ -1480,7 +1584,8 @@ private:
 
   bool argCount(CallExpr &c, const char *name, size_t n) {
     for (auto &a : c.args)
-      check(a);
+      if (!a->type) // some were already checked (e.g. by the append rewrite)
+        check(a);
     if (c.args.size() != n) {
       error(c.loc, std::string(name) + " expects " + std::to_string(n) + " argument" + (n == 1 ? "" : "s"));
       return false;
@@ -1513,8 +1618,8 @@ private:
       if (!argCount(c, "len", 1))
         return nullptr;
       Type *base = c.args[0]->type->derefAll();
-      if (base->kind != TypeKind::String && base->kind != TypeKind::Slice) {
-        error(c.args[0]->loc, "len needs a string or slice, found '" + c.args[0]->type->str() + "'");
+      if (base->kind != TypeKind::String && base->kind != TypeKind::Slice && base->kind != TypeKind::Map) {
+        error(c.args[0]->loc, "len needs a string, slice or map, found '" + c.args[0]->type->str() + "'");
         return nullptr;
       }
       autoRefShared(c.args[0]);
@@ -1525,7 +1630,11 @@ private:
         return nullptr;
       Type *st = c.args[0]->type;
       if (st->kind != TypeKind::Slice) {
-        if (st->derefAll()->kind == TypeKind::Slice)
+        if (c.args[0]->kind == ExprKind::Index &&
+            static_cast<IndexExpr *>(c.args[0].get())->mode == IndexExpr::MapRead)
+          error(c.args[0]->loc, "to add to a slice stored in a map, assign it back with the same key: "
+                                "'m[k] = append(m[k], x)'");
+        else if (st->derefAll()->kind == TypeKind::Slice)
           error(c.args[0]->loc, "append takes the slice by value; write 'v = append(v, x)' where v is the "
                                 "slice place itself (e.g. 'p.items = append(p.items, x)')");
         else
@@ -1572,6 +1681,34 @@ private:
         return nullptr;
       }
       return tc_.stringTy();
+    }
+    case Builtin::Delete: {
+      if (!argCount(c, "delete", 2))
+        return nullptr;
+      Type *mt = c.args[0]->type;
+      if (mt->derefAll()->kind != TypeKind::Map) {
+        error(c.args[0]->loc, "delete needs a map, found '" + mt->str() + "'");
+        return nullptr;
+      }
+      // `delete(m, k)` says it changes m, so it borrows m mutably by itself.
+      if (!mt->isRef()) {
+        if (isPlace(c.args[0].get()) && !checkMutablePlace(c.args[0].get(), "delete from"))
+          return nullptr;
+        c.args[0] = wrap(std::move(c.args[0]), UnOp::RefMut, tc_.ref(mt, true));
+      } else if (!mt->mut) {
+        error(c.args[0]->loc, "cannot delete from '" + exprStr(c.args[0].get()) + "': it is a shared reference");
+        return nullptr;
+      } else if (isPlace(c.args[0].get())) {
+        c.args[0] = wrap(std::move(c.args[0]), UnOp::ReborrowMut, mt);
+      }
+      Type *kt = mt->derefAll()->key;
+      Type *it = c.args[1]->type;
+      if (kt->kind == TypeKind::String ? it->derefAll()->kind != TypeKind::String : it != kt) {
+        error(c.args[1]->loc, "map key must be '" + kt->str() + "', found '" + it->str() + "'");
+        return nullptr;
+      }
+      autoRefShared(c.args[1]);
+      return tc_.voidTy();
     }
     case Builtin::MakeError: {
       if (!argCount(c, "error", 1))

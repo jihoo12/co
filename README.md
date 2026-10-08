@@ -90,11 +90,11 @@ for { break }                  // forever
 func add(a, b int) int { return a + b }
 ```
 
-Types: `int` (64-bit), `float` (64-bit), `bool`, `string`, slices `[]T`, structs, enums, optionals `?T`,
-results `!T`, `error`, and references `&T` / `&mut T`.
+Types: `int` (64-bit), `float` (64-bit), `bool`, `string`, slices `[]T`, maps `map[K]V`, structs, enums,
+optionals `?T`, results `!T`, `error`, and references `&T` / `&mut T`.
 
 Builtins: `println(...)`, `print(...)`, `len(x)`, `append(v, x)`, `clone(x)`, `str(x)`, `int(x)`,
-`float(x)`, `error(msg)`, `panic(msg)`. `println` can print anything, including structs, slices, enums and optionals.
+`float(x)`, `error(msg)`, `delete(m, k)`, `panic(msg)`. `println` can print anything, including structs, slices, enums and optionals.
 
 ## Structs and methods
 
@@ -121,6 +121,29 @@ for i, n := range nums { println(i, n) }   // index and element
 for _, n := range nums { total += n }      // just the element
 for i := range nums { nums[i] *= 2 }       // just the index (lets you modify nums)
 ```
+
+## Maps
+
+```go
+ages := map[string]int{"ann": 30, "bob": 25}
+ages["cat"] = 7                    // insert or update
+ages["ann"]++                      // a missing key starts from zero
+
+a := ages["ann"] or 0              // reading gives an optional (?int): handle "not found"
+if ages["zed"] == none { println("no zed") }
+
+delete(ages, "bob")
+println(len(ages), ages)           // 2 {ann: 31, cat: 7}
+
+for name, age := range ages { }    // insertion order, every time
+
+groups := map[string][]string{}
+groups["a"] = append(groups["a"], "x")   // grows the slice inside the map
+```
+
+Keys can be `int`, `string` or `bool`. Keys are copied into the map, so `m[name] = 1` doesn't use up
+`name`. An empty `var m map[K]V` is ready to use, unlike Go's nil maps. A value read from a map of
+strings (or other owned data) is borrowed, so the map can't change while you're still using it.
 
 ## Enums and switch
 
@@ -328,4 +351,5 @@ any access that conflicts with one.
 
 ## Not yet supported
 
-Generics, interfaces, closures, maps, modules/imports, string indexing, references inside structs.
+Generics, interfaces, closures, modules/imports, string functions (split, indexing, ...), references
+inside structs.

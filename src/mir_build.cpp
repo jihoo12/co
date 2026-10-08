@@ -11,8 +11,9 @@ bool isPlaceExpr(const Expr *e) {
   switch (e->kind) {
   case ExprKind::Ident:
   case ExprKind::Field:
-  case ExprKind::Index:
     return true;
+  case ExprKind::Index:
+    return static_cast<const IndexExpr *>(e)->mode != IndexExpr::MapRead;
   case ExprKind::Unary:
     return static_cast<const UnaryExpr *>(e)->op == UnOp::Deref;
   default:
@@ -285,6 +286,15 @@ private:
       Place p = placeOrTemp(ie->base.get());
       if (ie->autoDeref)
         p.proj.push_back({Proj::Deref});
+      if (ie->mode == IndexExpr::MapWrite) {
+        // The entry itself: *map_slot(&mut m, &k)
+        Operand key = lowerArg(ie->index.get());
+        Type *mt = ie->base->type->derefAll();
+        int r = newTemp(tc_.ref(mt->inner, true), e->loc);
+        assign(Place{r, {}}, builtinCall(BuiltinOp::MapSlot, f_.locals[r].type, {borrow(p, mt, true, e->loc), key}),
+               e->loc);
+        return Place{r, {}}.withProj({Proj::Deref});
+      }
       int idx = newTemp(tc_.intTy(), ie->index->loc);
       lowerInto(Place{idx, {}}, ie->index.get());
       p.proj.push_back({Proj::Index, -1, idx});
@@ -299,6 +309,32 @@ private:
     default:
       return placeOrTemp(e);
     }
+  }
+
+  Rvalue builtinCall(BuiltinOp op, Type *ty, std::vector<Operand> ops) {
+    Rvalue rv;
+    rv.kind = Rvalue::Builtin;
+    rv.builtin = op;
+    rv.type = ty;
+    rv.ops = std::move(ops);
+    return rv;
+  }
+
+  // A temporary reference to place `p` (of type `ty`).
+  Operand borrow(Place p, Type *ty, bool mut, SourceLoc loc) {
+    Type *rt = tc_.ref(ty, mut);
+    int r = newTemp(rt, loc);
+    Rvalue ref;
+    ref.kind = Rvalue::Ref;
+    ref.mut = mut;
+    ref.place = std::move(p);
+    ref.type = rt;
+    assign(Place{r, {}}, std::move(ref), loc);
+    Operand o;
+    o.kind = mut ? Operand::Move : Operand::Copy;
+    o.place.local = r;
+    o.type = rt;
+    return o;
   }
 
   // The enum place an expression refers to, looking through one reference.
@@ -472,11 +508,39 @@ private:
       assign(dest, std::move(rv), loc);
       return;
     }
+    case ExprKind::Index:
+      if (static_cast<const IndexExpr *>(e)->mode == IndexExpr::MapRead) {
+        auto *ie = static_cast<const IndexExpr *>(e);
+        Place p = placeOrTemp(ie->base.get());
+        if (ie->autoDeref)
+          p.proj.push_back({Proj::Deref});
+        Operand m = borrow(p, ie->base->type->derefAll(), false, loc);
+        Operand key = lowerArg(ie->index.get());
+        assign(dest, builtinCall(BuiltinOp::MapGet, e->type, {m, key}), loc);
+        return;
+      }
+      [[fallthrough]];
     case ExprKind::Ident:
     case ExprKind::Field:
-    case ExprKind::Index:
       assign(dest, use(useOf(lowerPlace(e), e->type, loc)), loc);
       return;
+    case ExprKind::MapLit: {
+      auto *ml = static_cast<const MapLitExpr *>(e);
+      Operand z;
+      z.kind = Operand::Const;
+      z.c.kind = Constant::Zero; // an empty map
+      z.type = e->type;
+      assign(dest, use(z), loc);
+      for (auto &[k, v] : ml->entries) {
+        Operand key = lowerArg(k.get());
+        Operand val = lowerArg(v.get());
+        int r = newTemp(tc_.ref(e->type->inner, true), loc);
+        assign(Place{r, {}},
+               builtinCall(BuiltinOp::MapSlot, f_.locals[r].type, {borrow(dest, e->type, true, loc), key}), loc);
+        assign(Place{r, {}}.withProj({Proj::Deref}), use(val), loc);
+      }
+      return;
+    }
     case ExprKind::Unary: {
       auto *u = static_cast<const UnaryExpr *>(e);
       Rvalue rv;
@@ -637,6 +701,7 @@ private:
       case Builtin::ToStr: rv.builtin = BuiltinOp::ToStr; break;
       case Builtin::Panic: rv.builtin = BuiltinOp::Panic; break;
       case Builtin::MakeError: rv.builtin = BuiltinOp::MakeError; break;
+      case Builtin::Delete: rv.builtin = BuiltinOp::MapDelete; break;
       case Builtin::None: break;
       }
       for (auto &a : c->args)
@@ -1005,7 +1070,12 @@ private:
     Type *intTy = tc_.intTy();
     int n = newTemp(intTy, fr.range->loc);
     int slice = -1;
-    if (fr.overSlice) {
+    if (fr.overMap) {
+      slice = newTemp(fr.range->type, fr.range->loc);
+      lowerInto(Place{slice, {}}, fr.range.get());
+      assign(Place{n, {}}, builtinCall(BuiltinOp::MapUsed, intTy, {copyOf(Place{slice, {}}, fr.range->type)}),
+             fr.range->loc);
+    } else if (fr.overSlice) {
       // The slice stays borrowed for the whole loop when elements are used.
       slice = newTemp(fr.range->type, fr.range->loc);
       lowerInto(Place{slice, {}}, fr.range.get());
@@ -1036,6 +1106,43 @@ private:
     cur_ = body;
     loops_.push_back({exit, cont, scopes_.size()});
     pushScope();
+    if (fr.overMap) {
+      // Skip deleted entries; bind the key and (optionally) the value.
+      Operand rop = copyOf(Place{slice, {}}, fr.range->type);
+      int alive = newTemp(tc_.boolTy(), fr.loc);
+      assign(Place{alive, {}}, builtinCall(BuiltinOp::MapAlive, tc_.boolTy(), {rop, copyOf(Place{i, {}}, intTy)}),
+             fr.loc);
+      int liveBB = newBlock();
+      branch(copyOf(Place{alive, {}}, tc_.boolTy()), liveBB, cont, fr.loc);
+      cur_ = liveBB;
+      int k = newLocal(fr.name, fr.var->type, fr.nameLoc);
+      vars_[fr.var] = k;
+      assign(Place{k, {}}, builtinCall(BuiltinOp::MapKeyAt, fr.var->type, {rop, copyOf(Place{i, {}}, intTy)}),
+             fr.nameLoc);
+      if (fr.valueVar) {
+        int x = newLocal(fr.valueName, fr.valueVar->type, fr.valueLoc);
+        vars_[fr.valueVar] = x;
+        assign(Place{x, {}},
+               builtinCall(BuiltinOp::MapValAt, fr.valueVar->type, {rop, copyOf(Place{i, {}}, intTy)}),
+               fr.valueLoc);
+      }
+      lowerBlock(*fr.body);
+      popScope(fr.body->endLoc);
+      loops_.pop_back();
+      gotoBlock(cont, fr.body->endLoc);
+      cur_ = cont;
+      Rvalue inc;
+      inc.kind = Rvalue::BinaryOp;
+      inc.bop = BinOp::Add;
+      inc.type = intTy;
+      inc.ops.push_back(copyOf(Place{i, {}}, intTy));
+      inc.ops.push_back(constInt(1, intTy));
+      assign(Place{i, {}}, std::move(inc), fr.loc);
+      gotoBlock(header, fr.loc);
+      cur_ = exit;
+      popScope(fr.body->endLoc);
+      return;
+    }
     int v = newLocal(fr.name, intTy, fr.nameLoc);
     vars_[fr.var] = v;
     assign(Place{v, {}}, use(copyOf(Place{i, {}}, intTy)), fr.nameLoc);

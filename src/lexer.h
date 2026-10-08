@@ -35,6 +35,7 @@ enum class Tok {
   KwNone,
   KwOr,
   KwTry,
+  KwMap,
   // punctuation
   LParen,
   RParen,

@@ -1,0 +1,21 @@
+// expect: 500 250
+// Lots of inserts, overwrites, deletes, clones and growth with owned keys and values.
+func main() {
+    m := map[string][]string{}
+    for i := range 1000 {
+        k := "key" + str(i % 500)
+        m[k] = append(m[k], "v" + str(i))
+    }
+    c := clone(m)
+    for i := range 500 {
+        if i % 2 == 0 { delete(c, "key" + str(i)) }
+    }
+    for i := range 300 {
+        c["new" + str(i)] = []string{"x"}
+        delete(c, "new" + str(i))
+    }
+    m = c                       // drops the old m
+    total := 0
+    for _, v := range m { total += len(v) }
+    println(len(clone(m)) * 2, total / 2)
+}

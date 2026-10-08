@@ -33,6 +33,7 @@ const char *tokName(Tok t) {
   case Tok::KwNone: return "'none'";
   case Tok::KwOr: return "'or'";
   case Tok::KwTry: return "'try'";
+  case Tok::KwMap: return "'map'";
   case Tok::Question: return "'?'";
   case Tok::LParen: return "'('";
   case Tok::RParen: return "')'";
@@ -104,7 +105,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
       {"false", Tok::KwFalse},   {"mut", Tok::KwMut},
       {"enum", Tok::KwEnum},     {"switch", Tok::KwSwitch}, {"case", Tok::KwCase},
       {"default", Tok::KwDefault}, {"none", Tok::KwNone},  {"or", Tok::KwOr},
-      {"try", Tok::KwTry},
+      {"try", Tok::KwTry},       {"map", Tok::KwMap},
   };
 
   std::vector<Token> toks;

@@ -98,6 +98,13 @@ static const char *builtinStr(BuiltinOp b) {
   case BuiltinOp::StrConcat: return "str_concat";
   case BuiltinOp::StrCmp: return "str_cmp";
   case BuiltinOp::MakeError: return "error";
+  case BuiltinOp::MapGet: return "map_get";
+  case BuiltinOp::MapSlot: return "map_slot";
+  case BuiltinOp::MapDelete: return "map_delete";
+  case BuiltinOp::MapUsed: return "map_used";
+  case BuiltinOp::MapAlive: return "map_alive";
+  case BuiltinOp::MapKeyAt: return "map_key_at";
+  case BuiltinOp::MapValAt: return "map_val_at";
   }
   return "?";
 }

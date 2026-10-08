@@ -1,0 +1,27 @@
+// Counting words with a map.
+
+func main() {
+    text := []string{"the", "quick", "fox", "the", "lazy", "fox", "the"}
+    counts := map[string]int{}
+    for _, w := range text {
+        counts[w]++                         // missing words start at 0
+    }
+    println(counts)                         // insertion order: {the: 3, quick: 1, fox: 2, lazy: 1}
+
+    best := ""
+    most := 0
+    for w, n := range counts {
+        if n > most {
+            best = clone(w)
+            most = n
+        }
+    }
+    println("most common:", best, most)
+    println("dog appears", counts["dog"] or 0, "times")
+
+    byLength := map[int][]string{}
+    for w, _ := range counts {
+        byLength[len(w)] = append(byLength[len(w)], clone(w))
+    }
+    println(byLength)
+}

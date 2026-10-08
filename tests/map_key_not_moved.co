@@ -1,0 +1,7 @@
+// expect: k 1
+func main() {
+    m := map[string]int{}
+    key := "k"
+    m[key] = 1          // the key is copied into the map; `key` is still ours
+    println(key, m[key] or 0)
+}

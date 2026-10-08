@@ -1,0 +1,8 @@
+// error: map keys must be int, string or bool
+// error: map key must be 'string', found 'int'
+type P struct { x int }
+func main() {
+    var bad map[P]int
+    m := map[string]int{}
+    m[5] = 1
+}

@@ -119,6 +119,14 @@ private:
         t->inner = parseType(); // a bare `!` means "nothing, or an error"
       return t;
     }
+    if (accept(Tok::KwMap)) {
+      t->kind = TypeExpr::Map;
+      expect(Tok::LBracket, "after 'map' (write map[KeyType]ValueType)");
+      t->key = parseType();
+      expect(Tok::RBracket, "after map key type");
+      t->inner = parseType();
+      return t;
+    }
     if (accept(Tok::LBracket)) {
       expect(Tok::RBracket, "in slice type");
       t->kind = TypeExpr::Slice;
@@ -244,6 +252,8 @@ private:
     c->loc = t.loc;
     if (t.inner)
       c->inner = cloneType(*t.inner);
+    if (t.key)
+      c->key = cloneType(*t.key);
     return c;
   }
 
@@ -636,6 +646,23 @@ private:
       noStructLit_ = saved;
       expect(Tok::RParen);
       return e;
+    }
+    case Tok::KwMap: {
+      auto ml = std::make_unique<MapLitExpr>(l, parseType());
+      expect(Tok::LBrace, "to start map literal");
+      skipSemis();
+      while (!at(Tok::RBrace)) {
+        auto k = parseExpr();
+        expect(Tok::Colon, "between map key and value");
+        auto v = parseExpr();
+        ml->entries.push_back({std::move(k), std::move(v)});
+        skipSemis();
+        if (!accept(Tok::Comma))
+          break;
+        skipSemis();
+      }
+      expect(Tok::RBrace, "to end map literal");
+      return ml;
     }
     case Tok::LBracket: {
       next();

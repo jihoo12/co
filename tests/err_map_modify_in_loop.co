@@ -1,0 +1,7 @@
+// error: cannot borrow 'm' as mutable because it is also borrowed as immutable
+func main() {
+    m := map[string]int{"a": 1}
+    for k, v := range m {
+        m["b"] = v              // could rehash the map while we iterate
+    }
+}

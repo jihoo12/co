@@ -65,6 +65,14 @@ enum class BuiltinOp {
   StrConcat, // (&string, &string) -> string
   StrCmp,    // (&string, &string) -> bool using `cmp`
   MakeError, // error(&string) -> error
+  // Maps. Keys are always passed by reference.
+  MapGet,    // (&map, &K) -> ?V or ?&V
+  MapSlot,   // (&mut map, &K) -> &mut V, inserting a zero value if missing
+  MapDelete, // (&mut map, &K)
+  MapUsed,   // (&map) -> number of entry slots (including deleted ones)
+  MapAlive,  // (&map, int) -> bool
+  MapKeyAt,  // (&map, int) -> K or &K
+  MapValAt,  // (&map, int) -> V or &V
 };
 
 struct Rvalue {

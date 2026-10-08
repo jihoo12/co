@@ -139,6 +139,166 @@ void co_vec_clone_bits(CoVec *out, const CoVec *src, int64_t elem_size) {
   out->len = src->len;
 }
 
+// ----- maps -----
+//
+// Insertion-ordered hash maps. Entries live in one array in insertion order
+// (so iteration is predictable); `index` is an open-addressing table of
+// entry positions (+1; 0 = empty, -1 = deleted). An entry is:
+//   int64 alive | key (rounded up to 8 bytes) | value (rounded up to 8 bytes)
+// Keys are copied in (strings are cloned), so callers only lend keys.
+
+typedef struct {
+  char *entries;
+  int64_t len, used, cap;
+  int64_t *index;
+  int64_t icap;
+} CoMap;
+
+enum { KEY_INT = 0, KEY_BOOL = 1, KEY_STR = 2 };
+
+static int64_t round8(int64_t n) { return (n + 7) & ~(int64_t)7; }
+static int64_t entry_size(int64_t ks, int64_t vs) { return 8 + round8(ks) + round8(vs); }
+
+static uint64_t hash_key(const void *k, int kind) {
+  uint64_t h;
+  if (kind == KEY_STR) {
+    const CoVec *s = k;
+    h = 1469598103934665603ull;
+    for (int64_t i = 0; i < s->len; i++)
+      h = (h ^ (unsigned char)s->ptr[i]) * 1099511628211ull;
+  } else if (kind == KEY_BOOL) {
+    h = *(const unsigned char *)k ? 0x9e3779b97f4a7c15ull : 0x7f4a7c159e3779b9ull;
+  } else {
+    h = (uint64_t)*(const int64_t *)k;
+  }
+  h ^= h >> 33; // finalizer (from splitmix64/murmur3)
+  h *= 0xff51afd7ed558ccdull;
+  h ^= h >> 33;
+  return h;
+}
+
+static int key_eq(const void *a, const void *b, int kind) {
+  if (kind == KEY_STR) {
+    const CoVec *x = a, *y = b;
+    return x->len == y->len && (x->len == 0 || memcmp(x->ptr, y->ptr, (size_t)x->len) == 0);
+  }
+  if (kind == KEY_BOOL)
+    return (*(const unsigned char *)a != 0) == (*(const unsigned char *)b != 0);
+  return *(const int64_t *)a == *(const int64_t *)b;
+}
+
+// Returns the index-table slot holding `key`, or -1.
+static int64_t find_slot(const CoMap *m, const void *key, int kind, int64_t es) {
+  if (!m->icap)
+    return -1;
+  uint64_t mask = (uint64_t)m->icap - 1;
+  for (uint64_t i = hash_key(key, kind) & mask;; i = (i + 1) & mask) {
+    int64_t e = m->index[i];
+    if (e == 0)
+      return -1;
+    if (e > 0 && key_eq(m->entries + (e - 1) * es + 8, key, kind))
+      return (int64_t)i;
+  }
+}
+
+static void index_insert(CoMap *m, int64_t entry, int kind, int64_t es) {
+  uint64_t mask = (uint64_t)m->icap - 1;
+  uint64_t i = hash_key(m->entries + entry * es + 8, kind) & mask;
+  while (m->index[i] > 0)
+    i = (i + 1) & mask;
+  m->index[i] = entry + 1;
+}
+
+// Drops deleted entries and resizes to hold `cap` entries.
+static void map_rebuild(CoMap *m, int kind, int64_t es, int64_t cap) {
+  char *entries = xrealloc(NULL, (size_t)(cap * es));
+  int64_t n = 0;
+  for (int64_t i = 0; i < m->used; i++) {
+    char *e = m->entries + i * es;
+    if (*(int64_t *)e)
+      memcpy(entries + n++ * es, e, (size_t)es);
+  }
+  co_free(m->entries);
+  co_free(m->index);
+  m->entries = entries;
+  m->used = n;
+  m->cap = cap;
+  m->icap = 8;
+  while (m->icap < cap * 2)
+    m->icap *= 2;
+  m->index = xrealloc(NULL, (size_t)m->icap * sizeof(int64_t));
+  memset(m->index, 0, (size_t)m->icap * sizeof(int64_t));
+  for (int64_t i = 0; i < n; i++)
+    index_insert(m, i, kind, es);
+}
+
+void *co_map_get(const CoMap *m, const void *key, int32_t kind, int64_t ks, int64_t vs) {
+  int64_t es = entry_size(ks, vs);
+  int64_t slot = find_slot(m, key, kind, es);
+  if (slot < 0)
+    return NULL;
+  return m->entries + (m->index[slot] - 1) * es + 8 + round8(ks);
+}
+
+// Returns the value for `key`, inserting a zeroed value first if missing.
+void *co_map_slot(CoMap *m, const void *key, int32_t kind, int64_t ks, int64_t vs) {
+  int64_t es = entry_size(ks, vs);
+  int64_t slot = find_slot(m, key, kind, es);
+  if (slot >= 0)
+    return m->entries + (m->index[slot] - 1) * es + 8 + round8(ks);
+  if (m->used == m->cap)
+    map_rebuild(m, kind, es, m->len * 2 < 8 ? 8 : m->len * 2);
+  char *e = m->entries + m->used * es;
+  memset(e, 0, (size_t)es);
+  *(int64_t *)e = 1;
+  if (kind == KEY_STR)
+    co_str_clone((CoVec *)(e + 8), key);
+  else
+    memcpy(e + 8, key, (size_t)ks);
+  index_insert(m, m->used, kind, es);
+  m->used++;
+  m->len++;
+  return e + 8 + round8(ks);
+}
+
+// Removes `key`; its value is moved to `out` (for the caller to drop).
+int32_t co_map_delete(CoMap *m, const void *key, int32_t kind, int64_t ks, int64_t vs, void *out) {
+  int64_t es = entry_size(ks, vs);
+  int64_t slot = find_slot(m, key, kind, es);
+  if (slot < 0)
+    return 0;
+  char *e = m->entries + (m->index[slot] - 1) * es;
+  *(int64_t *)e = 0;
+  if (kind == KEY_STR)
+    co_free(((CoVec *)(e + 8))->ptr);
+  memcpy(out, e + 8 + round8(ks), (size_t)vs);
+  m->index[slot] = -1;
+  m->len--;
+  return 1;
+}
+
+// Frees the map's storage (the compiler drops keys and values first).
+void co_map_free(CoMap *m) {
+  co_free(m->entries);
+  co_free(m->index);
+}
+
+// Bitwise copy; the compiler deep-clones keys and values afterwards.
+void co_map_clone_bits(CoMap *dst, const CoMap *src, int64_t ks, int64_t vs) {
+  int64_t es = entry_size(ks, vs);
+  *dst = *src;
+  dst->entries = NULL;
+  dst->index = NULL;
+  if (src->cap) {
+    dst->entries = xrealloc(NULL, (size_t)(src->cap * es));
+    memcpy(dst->entries, src->entries, (size_t)(src->used * es));
+  }
+  if (src->icap) {
+    dst->index = xrealloc(NULL, (size_t)src->icap * sizeof(int64_t));
+    memcpy(dst->index, src->index, (size_t)src->icap * sizeof(int64_t));
+  }
+}
+
 int main(void) {
   co_main();
   fflush(stdout);

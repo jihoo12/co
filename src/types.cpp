@@ -14,6 +14,7 @@ bool Type::isCopy() const {
   case TypeKind::String:
   case TypeKind::Error:
   case TypeKind::Slice:
+  case TypeKind::Map:
     return false;
   case TypeKind::Struct:
     // Structs cannot hold references, so "copy" is exactly "owns nothing".
@@ -35,6 +36,7 @@ bool Type::containsRef() const {
   switch (kind) {
   case TypeKind::Ref: return true;
   case TypeKind::Slice: return inner->containsRef();
+  case TypeKind::Map: return inner->containsRef();
   case TypeKind::Enum: return en->valueType() && en->valueType()->containsRef();
   default: return false;
   }
@@ -45,6 +47,7 @@ bool Type::needsDrop() const {
   case TypeKind::String:
   case TypeKind::Error:
   case TypeKind::Slice:
+  case TypeKind::Map:
     return true;
   case TypeKind::Struct:
     return st->needsDrop;
@@ -70,6 +73,7 @@ std::string Type::str() const {
   case TypeKind::None: return "none";
   case TypeKind::Ref: return (mut ? "&mut " : "&") + inner->str();
   case TypeKind::Slice: return "[]" + inner->str();
+  case TypeKind::Map: return "map[" + key->str() + "]" + inner->str();
   }
   return "?";
 }
@@ -142,6 +146,17 @@ Type *TypeContext::slice(Type *elem) {
     slot = std::make_unique<Type>();
     slot->kind = TypeKind::Slice;
     slot->inner = elem;
+  }
+  return slot.get();
+}
+
+Type *TypeContext::map(Type *key, Type *value) {
+  auto &slot = maps_[{key, value}];
+  if (!slot) {
+    slot = std::make_unique<Type>();
+    slot->kind = TypeKind::Map;
+    slot->key = key;
+    slot->inner = value;
   }
   return slot.get();
 }

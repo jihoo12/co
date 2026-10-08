@@ -35,6 +35,8 @@ public:
     f64_ = llvm::Type::getDoubleTy(ctx_);
     void_ = llvm::Type::getVoidTy(ctx_);
     vecTy_ = llvm::StructType::create(ctx_, {ptrTy_, i64_, i64_}, "co.vec");
+    // Same prefix as co.vec, so `len` reads field 1 of either.
+    mapTy_ = llvm::StructType::create(ctx_, {ptrTy_, i64_, i64_, i64_, ptrTy_, i64_}, "co.map");
   }
 
   void run(const Module &m) {
@@ -75,7 +77,7 @@ private:
   const llvm::DataLayout &dl_;
   llvm::PointerType *ptrTy_;
   llvm::Type *i64_, *i32_, *i1_, *f64_, *void_;
-  llvm::StructType *vecTy_;
+  llvm::StructType *vecTy_, *mapTy_;
   std::unordered_map<StructInfo *, llvm::StructType *> structTys_;
   std::unordered_map<FuncInfo *, llvm::Function *> fns_;
   std::unordered_map<Type *, llvm::Function *> dropFns_, cloneFns_, printFns_;
@@ -101,6 +103,7 @@ private:
     case TypeKind::Error:
     case TypeKind::Slice: return vecTy_;
     case TypeKind::Ref: return ptrTy_;
+    case TypeKind::Map: return mapTy_;
     case TypeKind::None: return i64_;
     case TypeKind::Enum: {
       // { i64 tag, [N x i64] payload } where the payload fits the largest variant.
@@ -136,6 +139,49 @@ private:
     for (Type *f : t->en->variants[v].fields)
       fields.push_back(lt(f));
     return llvm::StructType::get(ctx_, fields);
+  }
+
+  // ----- map layout helpers (must match runtime.c) -----
+
+  int64_t allocSize(Type *t) { return (int64_t)dl_.getTypeAllocSize(lt(t)); }
+  static int64_t round8(int64_t n) { return (n + 7) & ~(int64_t)7; }
+  int64_t entrySize(Type *m) { return 8 + round8(allocSize(m->key)) + round8(allocSize(m->inner)); }
+  llvm::Value *keyKind(Type *m) {
+    int k = m->key->kind == TypeKind::String ? 2 : m->key->kind == TypeKind::Bool ? 1 : 0;
+    return llvm::ConstantInt::get(i32_, k);
+  }
+  // Common trailing arguments for runtime map calls: kind, key size, value size.
+  std::vector<llvm::Value *> mapArgs(Type *m, std::vector<llvm::Value *> first) {
+    first.push_back(keyKind(m));
+    first.push_back(llvm::ConstantInt::get(i64_, allocSize(m->key)));
+    first.push_back(llvm::ConstantInt::get(i64_, allocSize(m->inner)));
+    return first;
+  }
+  llvm::Value *mapEntry(llvm::IRBuilder<> &ib, Type *m, llvm::Value *mp, llvm::Value *i) {
+    llvm::Value *entries = ib.CreateLoad(ptrTy_, ib.CreateStructGEP(mapTy_, mp, 0));
+    return ib.CreateGEP(llvm::Type::getInt8Ty(ctx_), entries,
+                        ib.CreateMul(i, llvm::ConstantInt::get(i64_, entrySize(m))));
+  }
+  llvm::Value *entryKey(llvm::IRBuilder<> &ib, llvm::Value *e) {
+    return ib.CreateConstGEP1_64(llvm::Type::getInt8Ty(ctx_), e, 8);
+  }
+  llvm::Value *entryVal(llvm::IRBuilder<> &ib, Type *m, llvm::Value *e) {
+    return ib.CreateConstGEP1_64(llvm::Type::getInt8Ty(ctx_), e, 8 + round8(allocSize(m->key)));
+  }
+  // Runs body(entryPtr) for every live entry of the map at `mp`.
+  void forEachEntry(llvm::IRBuilder<> &ib, Type *m, llvm::Value *mp, const std::function<void(llvm::Value *)> &body) {
+    llvm::Function *fn = ib.GetInsertBlock()->getParent();
+    llvm::Value *used = ib.CreateLoad(i64_, ib.CreateStructGEP(mapTy_, mp, 2));
+    emitLoop(ib, used, [&](llvm::Value *i) {
+      llvm::Value *e = mapEntry(ib, m, mp, i);
+      auto *live = llvm::BasicBlock::Create(ctx_, "entry.live", fn);
+      auto *next = llvm::BasicBlock::Create(ctx_, "entry.next", fn);
+      ib.CreateCondBr(ib.CreateICmpNE(ib.CreateLoad(i64_, e), llvm::ConstantInt::get(i64_, 0)), live, next);
+      ib.SetInsertPoint(live);
+      body(e);
+      ib.CreateBr(next);
+      ib.SetInsertPoint(next);
+    });
   }
 
   llvm::Value *sizeOf(Type *t) { return llvm::ConstantInt::get(i64_, dl_.getTypeAllocSize(lt(t))); }
@@ -230,6 +276,16 @@ private:
             ib.CreateCall(dropFn(fields[i]), {ib.CreateStructGEP(vt, payload, (unsigned)i)});
       });
       break;
+    case TypeKind::Map:
+      if (t->key->needsDrop() || t->inner->needsDrop())
+        forEachEntry(ib, t, p, [&](llvm::Value *e) {
+          if (t->key->needsDrop())
+            ib.CreateCall(dropFn(t->key), {entryKey(ib, e)});
+          if (t->inner->needsDrop())
+            ib.CreateCall(dropFn(t->inner), {entryVal(ib, t, e)});
+        });
+      ib.CreateCall(rt("co_map_free", void_, {ptrTy_}), {p});
+      break;
     default:
       break;
     }
@@ -298,6 +354,26 @@ private:
       text("]");
       break;
     }
+    case TypeKind::Map: {
+      text("{");
+      llvm::Value *first = ib.CreateAlloca(i1_);
+      ib.CreateStore(ib.getTrue(), first);
+      forEachEntry(ib, t, p, [&](llvm::Value *e) {
+        auto *sep = llvm::BasicBlock::Create(ctx_, "sep", fn);
+        auto *item = llvm::BasicBlock::Create(ctx_, "item", fn);
+        ib.CreateCondBr(ib.CreateLoad(i1_, first), item, sep);
+        ib.SetInsertPoint(sep);
+        text(", ");
+        ib.CreateBr(item);
+        ib.SetInsertPoint(item);
+        ib.CreateStore(ib.getFalse(), first);
+        ib.CreateCall(printFn(t->key), {entryKey(ib, e)});
+        text(": ");
+        ib.CreateCall(printFn(t->inner), {entryVal(ib, t, e)});
+      });
+      text("}");
+      break;
+    }
     case TypeKind::Struct: {
       auto *st = lt(t);
       text(t->st->name + "{");
@@ -354,6 +430,23 @@ private:
         llvm::Type *et = lt(t->inner);
         emitLoop(ib, len, [&](llvm::Value *i) {
           ib.CreateCall(ec, {ib.CreateGEP(et, dd, i), ib.CreateGEP(et, sd, i)});
+        });
+      }
+    } else if (t->kind == TypeKind::Map) {
+      ib.CreateCall(rt("co_map_clone_bits", void_, {ptrTy_, ptrTy_, i64_, i64_}),
+                    {dst, src, llvm::ConstantInt::get(i64_, allocSize(t->key)),
+                     llvm::ConstantInt::get(i64_, allocSize(t->inner))});
+      if (!t->key->isCopy() || !t->inner->isCopy()) {
+        llvm::Value *dentries = ib.CreateLoad(ptrTy_, ib.CreateStructGEP(mapTy_, dst, 0));
+        llvm::Value *sentries = ib.CreateLoad(ptrTy_, ib.CreateStructGEP(mapTy_, src, 0));
+        forEachEntry(ib, t, src, [&](llvm::Value *se) {
+          // Same offset in the destination's entry array.
+          llvm::Value *off = ib.CreatePtrDiff(llvm::Type::getInt8Ty(ctx_), se, sentries);
+          llvm::Value *de = ib.CreateGEP(llvm::Type::getInt8Ty(ctx_), dentries, off);
+          if (!t->key->isCopy())
+            ib.CreateCall(cloneFn(t->key), {entryKey(ib, de), entryKey(ib, se)});
+          if (!t->inner->isCopy())
+            ib.CreateCall(cloneFn(t->inner), {entryVal(ib, t, de), entryVal(ib, t, se)});
         });
       }
     } else if (t->kind == TypeKind::Enum) {
@@ -667,6 +760,61 @@ private:
       return rv.ops[0].type->kind == TypeKind::Int ? b_.CreateSIToFP(a[0], f64_) : a[0];
     case BuiltinOp::MakeError:
       return viaOut("co_str_clone", {ptrTy_}, {a[0]});
+    case BuiltinOp::MapGet: {
+      Type *m = rv.ops[0].type->inner;
+      llvm::Value *p = b_.CreateCall(rt("co_map_get", ptrTy_, {ptrTy_, ptrTy_, i32_, i64_, i64_}),
+                                     mapArgs(m, {a[0], a[1]}));
+      // Build ?V (or ?&V) from the possibly-null value pointer.
+      Type *opt = rv.type;
+      llvm::Type *ot = lt(opt);
+      llvm::Value *out = entryAlloca(ot);
+      b_.CreateStore(llvm::Constant::getNullValue(ot), out);
+      auto *found = llvm::BasicBlock::Create(ctx_, "found", fn_);
+      auto *done = llvm::BasicBlock::Create(ctx_, "lookup.done", fn_);
+      b_.CreateCondBr(b_.CreateIsNotNull(p), found, done);
+      b_.SetInsertPoint(found);
+      b_.CreateStore(llvm::ConstantInt::get(i64_, 1), b_.CreateStructGEP(ot, out, 0));
+      Type *inner = opt->en->optionalOf;
+      llvm::Value *payload = b_.CreateStructGEP(variantTy(opt, 1), b_.CreateStructGEP(ot, out, 1), 0);
+      b_.CreateStore(inner->isRef() ? p : b_.CreateLoad(lt(inner), p), payload);
+      b_.CreateBr(done);
+      b_.SetInsertPoint(done);
+      return b_.CreateLoad(ot, out);
+    }
+    case BuiltinOp::MapSlot: {
+      Type *m = rv.ops[0].type->inner;
+      return b_.CreateCall(rt("co_map_slot", ptrTy_, {ptrTy_, ptrTy_, i32_, i64_, i64_}), mapArgs(m, {a[0], a[1]}));
+    }
+    case BuiltinOp::MapDelete: {
+      Type *m = rv.ops[0].type->inner;
+      llvm::Value *tmp = entryAlloca(lt(m->inner));
+      std::vector<llvm::Value *> args = mapArgs(m, {a[0], a[1]});
+      args.push_back(tmp);
+      llvm::Value *found = b_.CreateCall(rt("co_map_delete", i32_, {ptrTy_, ptrTy_, i32_, i64_, i64_, ptrTy_}), args);
+      if (m->inner->needsDrop()) {
+        auto *drop = llvm::BasicBlock::Create(ctx_, "deleted", fn_);
+        auto *done = llvm::BasicBlock::Create(ctx_, "delete.done", fn_);
+        b_.CreateCondBr(b_.CreateICmpNE(found, llvm::ConstantInt::get(i32_, 0)), drop, done);
+        b_.SetInsertPoint(drop);
+        b_.CreateCall(dropFn(m->inner), {tmp});
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+      }
+      return nullptr;
+    }
+    case BuiltinOp::MapUsed:
+      return b_.CreateLoad(i64_, b_.CreateStructGEP(mapTy_, a[0], 2));
+    case BuiltinOp::MapAlive: {
+      llvm::Value *e = mapEntry(b_, rv.ops[0].type->inner, a[0], a[1]);
+      return b_.CreateICmpNE(b_.CreateLoad(i64_, e), llvm::ConstantInt::get(i64_, 0));
+    }
+    case BuiltinOp::MapKeyAt:
+    case BuiltinOp::MapValAt: {
+      Type *m = rv.ops[0].type->inner;
+      llvm::Value *e = mapEntry(b_, m, a[0], a[1]);
+      llvm::Value *p = rv.builtin == BuiltinOp::MapKeyAt ? entryKey(b_, e) : entryVal(b_, m, e);
+      return rv.type->isRef() ? p : b_.CreateLoad(lt(rv.type), p);
+    }
     case BuiltinOp::ToStr:
       switch (rv.ops[0].type->derefAll()->kind) {
       case TypeKind::Error: return viaOut("co_str_clone", {ptrTy_}, {a[0]});
