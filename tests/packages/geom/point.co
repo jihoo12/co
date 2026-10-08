@@ -1,0 +1,19 @@
+// Package geom spans point.co and shape.co: they share one namespace.
+
+type Point struct {
+    X, Y int
+    label string // unexported: only package geom can see it
+}
+
+func New(x, y int, label string) Point {
+    return Point{X: x, Y: y, label: label}
+}
+
+func (p &Point) Label() string { return clone(p.label) }
+
+func (p &mut Point) Move(dx, dy int) {
+    p.X += dx
+    p.Y += dy
+}
+
+func (p &Point) dist2() int { return square(p.X) + square(p.Y) }

@@ -4,6 +4,7 @@
 
 namespace co {
 
-std::unique_ptr<Program> parse(const std::vector<Token> &toks, Diagnostics &diag);
+// Parses one source file, adding its declarations to `prog` and its imports to `file`.
+void parseFile(const std::vector<Token> &toks, Program &prog, SourceFile &file, Diagnostics &diag);
 
 } // namespace co

@@ -1,0 +1,7 @@
+func Repeat(s &string, n int) string {
+    out := ""
+    for i := range n {
+        out += s
+    }
+    return out
+}

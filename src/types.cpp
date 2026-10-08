@@ -1,6 +1,13 @@
 #include "types.h"
 
+#include "ast.h"
+
 namespace co {
+
+// Types from other packages print as `pkg.Name`, like in source code.
+static std::string qualified(const Package *pkg, const std::string &name) {
+  return pkg && !pkg->isMain() ? pkg->name + "." + name : name;
+}
 
 bool Type::isCopy() const {
   switch (kind) {
@@ -68,8 +75,8 @@ std::string Type::str() const {
   case TypeKind::Bool: return "bool";
   case TypeKind::String: return "string";
   case TypeKind::Error: return "error";
-  case TypeKind::Struct: return st->name;
-  case TypeKind::Enum: return en->name;
+  case TypeKind::Struct: return qualified(st->pkg, st->name);
+  case TypeKind::Enum: return qualified(en->pkg, en->name);
   case TypeKind::None: return "none";
   case TypeKind::Ref: return (mut ? "&mut " : "&") + inner->str();
   case TypeKind::Slice: return "[]" + inner->str();

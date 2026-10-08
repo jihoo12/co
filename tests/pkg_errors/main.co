@@ -1,0 +1,23 @@
+// Names starting with a lower-case letter stay inside their package.
+// error: function 'helper' is not exported by package lib
+// error: field 'hidden' is not exported by package lib
+// error: type 'private' is not exported by package lib
+// error: method 'peek' is not exported by package lib
+// error: package lib has no 'Nope'
+// error: unknown package 'other'
+// error: cannot define methods on 'lib.Secret', which belongs to another package
+// error: package 'lib' can only be used as 'lib.Name'
+import "lib"
+
+func (s &lib.Secret) Extra() int { return 1 }
+
+func main() {
+    println(lib.Public())
+    println(lib.helper())
+    s := lib.Secret{Shown: 1, hidden: 2}
+    println(s.Shown, s.hidden, s.Peek(), s.peek())
+    var p lib.private
+    println(lib.Nope)
+    var o other.Thing
+    x := lib
+}

@@ -53,6 +53,7 @@ add_executable(coc
   src/borrowck.cpp
   src/codegen.cpp
   src/linker.cpp
+  src/loader.cpp
   ${CO_RUNTIME_CPP}
 )
 target_include_directories(coc PRIVATE src runtime ${LLVM_INCLUDE_DIRS})

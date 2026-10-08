@@ -1,0 +1,9 @@
+// A directory without imports: its files form the main package together.
+// expect: 6
+func main() {
+    c := Counter{}
+    c.bump()
+    c.bump()
+    c.bump()
+    println(twice(c.n))
+}

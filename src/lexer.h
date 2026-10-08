@@ -36,6 +36,7 @@ enum class Tok {
   KwOr,
   KwTry,
   KwMap,
+  KwImport,
   // punctuation
   LParen,
   RParen,
@@ -87,6 +88,7 @@ struct Token {
 
 // Tokenizes source code. Like Go, a semicolon is inserted automatically at a
 // newline when the line ends with a token that can end a statement.
-std::vector<Token> lex(const std::string &src, Diagnostics &diag);
+// `file` is the source file index stamped into every token location.
+std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag);
 
 } // namespace co

@@ -34,6 +34,7 @@ const char *tokName(Tok t) {
   case Tok::KwOr: return "'or'";
   case Tok::KwTry: return "'try'";
   case Tok::KwMap: return "'map'";
+  case Tok::KwImport: return "'import'";
   case Tok::Question: return "'?'";
   case Tok::LParen: return "'('";
   case Tok::RParen: return "')'";
@@ -96,7 +97,7 @@ static bool endsStatement(Tok t) {
   }
 }
 
-std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
+std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag) {
   static const std::unordered_map<std::string, Tok> keywords = {
       {"func", Tok::KwFunc},     {"type", Tok::KwType},   {"struct", Tok::KwStruct},
       {"var", Tok::KwVar},       {"return", Tok::KwReturn}, {"if", Tok::KwIf},
@@ -105,7 +106,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
       {"false", Tok::KwFalse},   {"mut", Tok::KwMut},
       {"enum", Tok::KwEnum},     {"switch", Tok::KwSwitch}, {"case", Tok::KwCase},
       {"default", Tok::KwDefault}, {"none", Tok::KwNone},  {"or", Tok::KwOr},
-      {"try", Tok::KwTry},       {"map", Tok::KwMap},
+      {"try", Tok::KwTry},       {"map", Tok::KwMap},     {"import", Tok::KwImport},
   };
 
   std::vector<Token> toks;
@@ -124,7 +125,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
   };
   auto newline = [&]() {
     if (!toks.empty() && endsStatement(toks.back().kind))
-      toks.push_back({Tok::Semi, "\n", 0, 0, {line, col}});
+      toks.push_back({Tok::Semi, "\n", 0, 0, {line, col, file}});
   };
 
   while (i < src.size()) {
@@ -144,7 +145,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
       continue;
     }
     if (c == '/' && peek(1) == '*') {
-      SourceLoc start{line, col};
+      SourceLoc start{line, col, file};
       advance();
       advance();
       bool sawNewline = false;
@@ -164,7 +165,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
       continue;
     }
 
-    SourceLoc loc{line, col};
+    SourceLoc loc{line, col, file};
     Token tok{Tok::Eof, "", 0, 0, loc};
 
     if (isalpha((unsigned char)c) || c == '_') {
@@ -248,7 +249,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
           case '\\': s += '\\'; break;
           case '"': s += '"'; break;
           default:
-            diag.error({line, col}, std::string("unknown escape sequence '\\") + e + "'");
+            diag.error({line, col, file}, std::string("unknown escape sequence '\\") + e + "'");
           }
           advance();
           continue;
@@ -323,7 +324,7 @@ std::vector<Token> lex(const std::string &src, Diagnostics &diag) {
     toks.push_back(tok);
   }
   newline();
-  toks.push_back({Tok::Eof, "", 0, 0, {line, col}});
+  toks.push_back({Tok::Eof, "", 0, 0, {line, col, file}});
   return toks;
 }
 

@@ -7,29 +7,38 @@ struct ParseError {};
 
 class Parser {
 public:
-  Parser(const std::vector<Token> &toks, Diagnostics &diag) : toks_(toks), diag_(diag) {}
+  Parser(const std::vector<Token> &toks, Program &prog, SourceFile &file, Diagnostics &diag)
+      : toks_(toks), prog_(prog), file_(file), diag_(diag) {}
 
-  std::unique_ptr<Program> parseProgram() {
-    auto prog = std::make_unique<Program>();
+  void parseFile() {
+    bool declared = false;
     while (!at(Tok::Eof)) {
       try {
         if (accept(Tok::Semi))
           continue;
-        if (at(Tok::KwType))
-          parseTypeDecl(*prog);
-        else if (at(Tok::KwFunc))
-          prog->funcs.push_back(parseFuncDecl());
-        else
+        if (at(Tok::KwImport)) {
+          if (declared)
+            fail("imports must come before other declarations");
+          parseImport();
+        } else if (at(Tok::KwType)) {
+          declared = true;
+          parseTypeDecl(prog_);
+        } else if (at(Tok::KwFunc)) {
+          declared = true;
+          prog_.funcs.push_back(parseFuncDecl());
+        } else {
           fail("expected 'func' or 'type' declaration, found " + describe(cur()));
+        }
       } catch (ParseError &) {
         recoverTopLevel();
       }
     }
-    return prog;
   }
 
 private:
   const std::vector<Token> &toks_;
+  Program &prog_;
+  SourceFile &file_;
   Diagnostics &diag_;
   size_t pos_ = 0;
   bool noStructLit_ = false; // inside if/for headers, `x {` starts the block
@@ -80,10 +89,39 @@ private:
   }
   void recoverTopLevel() {
     while (!at(Tok::Eof)) {
-      if ((at(Tok::KwFunc) || at(Tok::KwType)) && pos_ > 0 && toks_[pos_ - 1].kind == Tok::Semi)
+      if ((at(Tok::KwFunc) || at(Tok::KwType) || at(Tok::KwImport)) && pos_ > 0 &&
+          toks_[pos_ - 1].kind == Tok::Semi)
         return;
       next();
     }
+  }
+
+  // ----- imports -----
+
+  // `import "path"`, `import name "path"`, or a parenthesized list of those.
+  void parseImport() {
+    expect(Tok::KwImport);
+    if (!accept(Tok::LParen)) {
+      parseImportSpec();
+      return;
+    }
+    skipSemis();
+    while (!at(Tok::RParen)) {
+      parseImportSpec();
+      if (!at(Tok::RParen))
+        expect(Tok::Semi, "between imports");
+      skipSemis();
+    }
+    expect(Tok::RParen, "to end the import list");
+  }
+
+  void parseImportSpec() {
+    Import imp;
+    imp.loc = loc();
+    if (at(Tok::Ident))
+      imp.name = next().text;
+    imp.path = expect(Tok::String, "with the package path, like import \"geom\"").text;
+    file_.imports.push_back(std::move(imp));
   }
 
   // ----- types -----
@@ -136,6 +174,11 @@ private:
     if (at(Tok::Ident)) {
       t->kind = TypeExpr::Name;
       t->name = next().text;
+      if (at(Tok::Dot) && peekTok().kind == Tok::Ident) { // pkg.Type
+        next();
+        t->pkg = std::move(t->name);
+        t->name = next().text;
+      }
       return t;
     }
     fail("expected a type, found " + describe(cur()));
@@ -186,7 +229,8 @@ private:
     std::vector<TypeExprPtr> out;
     std::vector<TypeExprPtr> pending; // bare identifiers: names or types
     while (!at(Tok::RParen)) {
-      if (at(Tok::Ident) && peekTok(1).kind != Tok::Comma && peekTok(1).kind != Tok::RParen) {
+      if (at(Tok::Ident) && peekTok(1).kind != Tok::Comma && peekTok(1).kind != Tok::RParen &&
+          peekTok(1).kind != Tok::Dot) {
         next(); // a field name
         auto ty = parseType();
         for (size_t i = 0; i < pending.size(); i++)
@@ -248,6 +292,7 @@ private:
     auto c = std::make_unique<TypeExpr>();
     c->kind = t.kind;
     c->name = t.name;
+    c->pkg = t.pkg;
     c->mut = t.mut;
     c->loc = t.loc;
     if (t.inner)
@@ -587,6 +632,12 @@ private:
       if (accept(Tok::Dot)) {
         SourceLoc nl = loc();
         std::string name = expect(Tok::Ident, "after '.'").text;
+        if (e->kind == ExprKind::Ident && at(Tok::LBrace) && !noStructLit_) { // pkg.Type{...}
+          auto sl = parseStructLit(e->loc, name);
+          sl->pkg = static_cast<IdentExpr *>(e.get())->name;
+          e = std::move(sl);
+          continue;
+        }
         e = std::make_unique<FieldExpr>(nl, std::move(e), name);
       } else if (accept(Tok::LParen)) {
         auto call = std::make_unique<CallExpr>(l, std::move(e));
@@ -691,7 +742,7 @@ private:
     }
   }
 
-  ExprPtr parseStructLit(SourceLoc l, const std::string &name) {
+  std::unique_ptr<StructLitExpr> parseStructLit(SourceLoc l, const std::string &name) {
     auto sl = std::make_unique<StructLitExpr>(l, name);
     expect(Tok::LBrace);
     skipSemis();
@@ -714,9 +765,9 @@ private:
 
 } // namespace
 
-std::unique_ptr<Program> parse(const std::vector<Token> &toks, Diagnostics &diag) {
-  Parser p(toks, diag);
-  return p.parseProgram();
+void parseFile(const std::vector<Token> &toks, Program &prog, SourceFile &file, Diagnostics &diag) {
+  Parser p(toks, prog, file, diag);
+  p.parseFile();
 }
 
 } // namespace co

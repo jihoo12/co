@@ -7,6 +7,7 @@ namespace co {
 struct SourceLoc {
   int line = 0;
   int col = 0;
+  int file = 0; // index of the file in Diagnostics (and Program::files)
 };
 
 struct Note {
@@ -23,7 +24,8 @@ struct Diagnostic {
 // Collects and prints compiler errors with source excerpts.
 class Diagnostics {
 public:
-  Diagnostics(std::string filename, const std::string &source);
+  // Registers a source file; returns its index for SourceLoc::file.
+  int addFile(std::string filename, const std::string &source);
 
   void error(SourceLoc loc, std::string message, std::vector<Note> notes = {});
   bool hasErrors() const { return !diags_.empty(); }
@@ -33,8 +35,13 @@ public:
 private:
   void printExcerpt(SourceLoc loc) const;
 
-  std::string filename_;
-  std::vector<std::string> lines_;
+  struct File {
+    std::string name;
+    std::vector<std::string> lines;
+  };
+  const File *file(SourceLoc loc) const;
+
+  std::vector<File> files_;
   std::vector<Diagnostic> diags_;
 };
 

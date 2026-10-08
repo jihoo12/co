@@ -12,6 +12,7 @@ namespace co {
 struct StructInfo;
 struct EnumInfo;
 struct FuncInfo;
+struct Package;
 
 // `None` is the type of the `none` literal before it is converted to some `?T`.
 // Optionals `?T` are enums with variants `none` and `some(T)`; results `!T`
@@ -50,6 +51,7 @@ struct FieldInfo {
 };
 
 struct StructInfo {
+  Package *pkg = nullptr;
   std::string name;
   SourceLoc loc;
   std::vector<FieldInfo> fields;
@@ -65,6 +67,7 @@ struct Variant {
 };
 
 struct EnumInfo {
+  Package *pkg = nullptr; // null for optionals and results
   std::string name;
   SourceLoc loc;
   std::vector<Variant> variants;

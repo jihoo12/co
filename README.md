@@ -249,6 +249,54 @@ compile error. `func main() !` may use `try`, and an error that reaches it is pr
 `error: ...` with exit status 1, which is handy for scripts. `try` also works on optionals inside a
 function returning `?T`, where it passes `none` on. Add context with `+`: `error("loading config: " + e)`.
 
+## Packages
+
+As in Go, a directory is a package: all of its `.co` files share one namespace, so splitting a
+package into files needs no imports. Names starting with an upper-case letter (functions, types,
+fields, methods) are visible to other packages; everything else stays private.
+
+```
+project/
+  co.mod          // marks the project root (can be empty)
+  main.co
+  geom/
+    point.co
+    shape.co
+```
+
+```go
+// geom/point.co
+type Point struct {
+    X, Y int
+    label string               // private to package geom
+}
+
+func New(x, y int) Point { return Point{X: x, Y: y, label: "new"} }
+func (p &Point) Far() bool { return dist2(p) > 100 }
+func dist2(p &Point) int { return p.X*p.X + p.Y*p.Y }     // private
+```
+
+```go
+// main.co
+import (
+    "geom"
+    s "util/strs"              // import under another name
+)
+
+func main() {
+    p := geom.New(3, 4)
+    q := geom.Point{X: 20}
+    println(p.X, q.Far())
+    shapes := []geom.Shape{geom.Circle(2), geom.Shape.Rect(3, 4)}
+}
+```
+
+`import "a/b"` loads the directory `a/b` under the project root: the nearest directory, going up
+from the program, that contains a `co.mod` file (or else the program's own directory). Import
+cycles are an error. `coc run main.co` compiles just that file as the main package;
+`coc run .` compiles every `.co` file in the directory. Variants of an exported enum can be written
+`geom.Circle(2)` or `geom.Shape.Circle(2)`, and the same goes for `case` patterns.
+
 ---
 
 # Ownership in 5 rules
@@ -341,6 +389,7 @@ source ─► lexer ─► parser ─► AST ─► sema ─► MIR ─► borro
 
 | file                  | role                                                                 |
 |-----------------------|----------------------------------------------------------------------|
+| `src/loader.cpp`      | finds the main package's files and, through imports, every package   |
 | `src/lexer.cpp`       | tokens + Go-style automatic semicolons                               |
 | `src/parser.cpp`      | recursive-descent parser producing the AST (`src/ast.h`)             |
 | `src/sema.cpp`        | types, methods, enums, auto-borrowing, optionals, exhaustiveness      |
@@ -370,5 +419,5 @@ any access that conflicts with one.
 
 ## Not yet supported
 
-Generics, interfaces, closures, modules/imports, string functions (split, indexing, ...), references
+Generics, interfaces, closures, a standard library of packages, string functions (split, indexing, ...), references
 inside structs.

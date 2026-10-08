@@ -1,0 +1,59 @@
+// A program with packages: geom (two files) and util/strs (imported as s).
+// expect: 4 5 home
+// expect: false true
+// expect: circle 2
+// expect: rect 3x4
+// expect: 24
+// expect: 24
+// expect: Point{X: 20, Y: 0, label: }
+// expect: 1 ababab
+// expect: Point{Z: 7} 49
+import (
+    "geom"
+    s "util/strs"
+)
+
+// Same names as in package geom: each package has its own namespace.
+type Point struct { Z int }
+
+func square(n int) int { return n * n }
+
+type Pair struct {
+    a, b geom.Point
+}
+
+func describe(sh &geom.Shape) string {
+    out := ""
+    switch sh {
+    case geom.Circle(r): out = "circle " + str(r)
+    case geom.Shape.Rect(w, h): out = "rect " + str(w) + "x" + str(h)
+    }
+    return out
+}
+
+func main() {
+    p := geom.New(3, 4, "home")
+    p.Move(1, 1)
+    println(p.X, p.Y, p.Label())
+    q := geom.Point{X: 20, Y: 0}
+    println(geom.Far(p), geom.Far(q))
+
+    shapes := []geom.Shape{geom.Circle(2), geom.Shape.Rect(3, 4)}
+    total := 0
+    for _, sh := range shapes {
+        total += geom.Area(sh)
+        println(describe(sh))
+    }
+    println(total)
+
+    pair := Pair{a: p, b: q}
+    println(pair.a.X + pair.b.X)
+    println(pair.b)
+
+    byName := map[string]geom.Point{}
+    byName["origin"] = geom.Point{}
+    println(len(byName), s.Repeat("ab", 3))
+
+    mine := Point{Z: 7}
+    println(mine, square(mine.Z))
+}

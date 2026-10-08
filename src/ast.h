@@ -15,6 +15,7 @@ namespace co {
 struct TypeExpr {
   enum Kind { Name, Ref, Slice, Optional, Result, Map } kind = Name; // Result: `!T`, or `!` (inner null)
   std::string name;  // Name
+  std::string pkg;   // Name: the import name in `pkg.Name`, if qualified
   bool mut = false;  // Ref
   std::unique_ptr<TypeExpr> inner; // for Map: the value type
   std::unique_ptr<TypeExpr> key;   // Map
@@ -134,6 +135,7 @@ struct FieldInit {
 };
 struct StructLitExpr : Expr {
   std::string name;
+  std::string pkg; // the import name in `pkg.Name{...}`, if qualified
   std::vector<FieldInit> fields;
   StructInfo *st = nullptr;
   StructLitExpr(SourceLoc l, std::string n) : Expr(ExprKind::StructLit, l), name(std::move(n)) {}
@@ -300,6 +302,7 @@ struct EnumDecl {
 };
 
 struct FuncInfo {
+  Package *pkg = nullptr;
   std::string name;    // source name (method name for methods)
   std::string symbol;  // LLVM symbol name
   SourceLoc loc;
@@ -310,7 +313,43 @@ struct FuncInfo {
   FuncDecl *decl = nullptr;
 };
 
+// ----- Packages -----
+
+struct Import {
+  std::string name; // how the file refers to the package (its last path element, or an alias)
+  std::string path;
+  SourceLoc loc;
+  Package *pkg = nullptr;
+};
+
+struct SourceFile {
+  std::string path;
+  Package *pkg = nullptr;
+  std::vector<Import> imports;
+};
+
+// A directory of .co files sharing one namespace (or, for the main package,
+// possibly a single file). Names starting with an upper-case letter are
+// visible to importers.
+struct Package {
+  std::string path; // import path; empty for the main package
+  std::string name; // last element of the path; "main" for the main package
+  // Filled by sema:
+  std::unordered_map<std::string, StructInfo *> structs;
+  std::unordered_map<std::string, EnumInfo *> enums;
+  // Variant names usable without the enum prefix; nullptr if ambiguous.
+  std::unordered_map<std::string, std::pair<EnumInfo *, int>> variants;
+  std::unordered_map<std::string, FuncInfo *> funcs;
+  bool isMain() const { return path.empty(); }
+};
+
+inline bool isExported(const std::string &name) { return !name.empty() && name[0] >= 'A' && name[0] <= 'Z'; }
+
+// The whole program: every package, with declarations of all of them in one
+// list per kind. A declaration's package is that of its file (loc.file).
 struct Program {
+  std::vector<std::unique_ptr<Package>> packages; // packages[0] is the main package
+  std::vector<std::unique_ptr<SourceFile>> files;  // indexed by SourceLoc::file
   std::vector<std::unique_ptr<StructDecl>> structs;
   std::vector<std::unique_ptr<EnumDecl>> enums;
   std::vector<std::unique_ptr<FuncDecl>> funcs;

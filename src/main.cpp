@@ -2,10 +2,9 @@
 #include "borrowck.h"
 #include "codegen.h"
 #include "diag.h"
-#include "lexer.h"
 #include "linker.h"
+#include "loader.h"
 #include "mir_build.h"
-#include "parser.h"
 #include "sema.h"
 
 #include <llvm/Support/FileSystem.h>
@@ -22,15 +21,19 @@ using namespace co;
 
 static void usage() {
   fprintf(stderr,
-          "usage: coc <command> <file.co> [options]\n"
+          "usage: coc <command> <file.co | directory> [options]\n"
           "\n"
           "commands:\n"
           "  build   compile to an executable\n"
           "  run     compile and run (extra arguments after the file are ignored for now)\n"
           "  check   type-check and borrow-check only\n"
           "\n"
+          "A file is compiled on its own; a directory compiles all of its .co files\n"
+          "together. Either way, imported packages are found under the project root\n"
+          "(the nearest directory with a co.mod file, or else the program's directory).\n"
+          "\n"
           "options:\n"
-          "  -o <path>      output executable (default: file name without .co)\n"
+          "  -o <path>      output executable (default: file name without .co, or the directory's name)\n"
           "  -O0 .. -O3     optimization level (default -O2)\n"
           "  --emit-llvm    also write <output>.ll\n"
           "  --emit-mir     print the MIR to stdout\n");
@@ -78,18 +81,10 @@ int main(int argc, char **argv) {
     }
   }
 
-  std::ifstream in(input, std::ios::binary);
-  if (!in) {
-    fprintf(stderr, "coc: cannot open '%s'\n", input.c_str());
+  Diagnostics diag;
+  auto prog = loadProgram(input, diag);
+  if (!prog)
     return 1;
-  }
-  std::stringstream ss;
-  ss << in.rdbuf();
-  std::string src = ss.str();
-
-  Diagnostics diag(input, src);
-  auto toks = lex(src, diag);
-  auto prog = parse(toks, diag);
   if (diag.hasErrors()) {
     diag.print();
     return 1;
@@ -127,6 +122,14 @@ int main(int argc, char **argv) {
       }
       output = std::string(tmp);
       temporaryExe = true;
+    } else if (llvm::sys::fs::is_directory(input)) {
+      // Like `go build`: named after the directory, in the current directory.
+      llvm::SmallString<128> abs(input);
+      llvm::sys::fs::make_absolute(abs);
+      llvm::sys::path::remove_dots(abs, true);
+      output = llvm::sys::path::filename(abs).str();
+      if (output.empty() || llvm::sys::fs::is_directory(output))
+        output += ".out";
     } else {
       llvm::SmallString<128> p(input);
       llvm::sys::path::replace_extension(p, "");

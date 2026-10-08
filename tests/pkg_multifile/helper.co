@@ -1,0 +1,5 @@
+type Counter struct { n int }
+
+func (c &mut Counter) bump() { c.n++ }
+
+func twice(x int) int { return x * 2 }

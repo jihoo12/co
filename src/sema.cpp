@@ -124,20 +124,22 @@ public:
   void run() {
     declareStructs();
     declareFuncs();
+    checkImportNames();
     for (auto &fd : prog_.funcs)
-      if (fd->info)
+      if (fd->info) {
+        enter(fd->loc);
         checkFunc(*fd);
+      }
   }
 
 private:
   Program &prog_;
   TypeContext &tc_;
   Diagnostics &diag_;
-  std::unordered_map<std::string, StructInfo *> structs_;
-  std::unordered_map<std::string, EnumInfo *> enums_;
-  // Variant names usable without the enum prefix; nullptr if ambiguous.
-  std::unordered_map<std::string, std::pair<EnumInfo *, int>> variants_;
-  std::unordered_map<std::string, FuncInfo *> funcs_;
+  // The file and package of the declaration being checked: names resolve in
+  // the package, and `pkg.Name` through the file's imports.
+  SourceFile *file_ = nullptr;
+  Package *pkg_ = nullptr;
 
   FuncDecl *fn_ = nullptr;
   std::vector<std::unordered_map<std::string, LocalVar *>> scopes_;
@@ -145,6 +147,63 @@ private:
   int breakDepth_ = 0; // loops and switches
 
   void error(SourceLoc l, std::string msg) { diag_.error(l, std::move(msg)); }
+
+  // ----- packages -----
+
+  void enter(SourceLoc declLoc) {
+    file_ = prog_.files[declLoc.file].get();
+    pkg_ = file_->pkg;
+  }
+
+  // The import `name` refers to in the current file, unless a variable shadows it.
+  const Import *findImport(const std::string &name) {
+    if (lookup(name))
+      return nullptr;
+    for (auto &imp : file_->imports)
+      if (imp.name == name)
+        return &imp;
+    return nullptr;
+  }
+
+  // Checks that `name`, declared in package `owner`, may be used from the current package.
+  bool visible(Package *owner, const std::string &name, const std::string &what, SourceLoc loc) {
+    if (owner == pkg_ || isExported(name))
+      return true;
+    error(loc, what + " '" + name + "' is not exported by package " + owner->name +
+                   " (only names starting with an upper-case letter are)");
+    return false;
+  }
+
+  // `pkg.Name` naming a type: the struct or enum, or null after reporting an error.
+  // Exactly one of st / en is set on success.
+  bool qualifiedType(const Import &imp, const std::string &name, SourceLoc loc, StructInfo *&st, EnumInfo *&en) {
+    st = nullptr;
+    en = nullptr;
+    if (!imp.pkg)
+      return false; // the import itself failed
+    auto s = imp.pkg->structs.find(name);
+    auto e = imp.pkg->enums.find(name);
+    if (s != imp.pkg->structs.end())
+      st = s->second;
+    else if (e != imp.pkg->enums.end())
+      en = e->second;
+    else {
+      error(loc, "package " + imp.name + " has no type '" + name + "'");
+      return false;
+    }
+    return visible(imp.pkg, name, "type", loc);
+  }
+
+  // An import name must not also name something declared in the package.
+  void checkImportNames() {
+    for (auto &f : prog_.files)
+      for (auto &imp : f->imports) {
+        Package *p = f->pkg;
+        if (p->structs.count(imp.name) || p->enums.count(imp.name) || p->funcs.count(imp.name))
+          error(imp.loc, "'" + imp.name + "' is both an imported package and a name declared in this package; "
+                         "import it under another name (import other \"" + imp.path + "\")");
+      }
+  }
 
   // ----- types -----
 
@@ -156,11 +215,23 @@ private:
       if (t.name == "bool") return tc_.boolTy();
       if (t.name == "string") return tc_.stringTy();
       if (t.name == "error") return tc_.errorTy();
-      auto it = structs_.find(t.name);
-      if (it != structs_.end())
+      if (!t.pkg.empty()) {
+        const Import *imp = findImport(t.pkg);
+        if (!imp) {
+          error(t.loc, "unknown package '" + t.pkg + "' (missing import \"" + t.pkg + "\"?)");
+          return nullptr;
+        }
+        StructInfo *st;
+        EnumInfo *en;
+        if (!qualifiedType(*imp, t.name, t.loc, st, en))
+          return nullptr;
+        return st ? tc_.structTy(st) : tc_.enumTy(en);
+      }
+      auto it = pkg_->structs.find(t.name);
+      if (it != pkg_->structs.end())
         return tc_.structTy(it->second);
-      auto en = enums_.find(t.name);
-      if (en != enums_.end())
+      auto en = pkg_->enums.find(t.name);
+      if (en != pkg_->enums.end())
         return tc_.enumTy(en->second);
       error(t.loc, "unknown type '" + t.name + "'");
       return nullptr;
@@ -217,38 +288,43 @@ private:
   }
 
   bool typeNameTaken(const std::string &n) {
-    return structs_.count(n) || enums_.count(n) || n == "int" || n == "float" || n == "bool" ||
+    return pkg_->structs.count(n) || pkg_->enums.count(n) || n == "int" || n == "float" || n == "bool" ||
            n == "string" || n == "error";
   }
 
   void declareStructs() {
     for (auto &ed : prog_.enums) {
+      enter(ed->loc);
       if (typeNameTaken(ed->name)) {
         error(ed->loc, "type '" + ed->name + "' is already defined");
         continue;
       }
       auto info = std::make_unique<EnumInfo>();
+      info->pkg = pkg_;
       info->name = ed->name;
       info->loc = ed->loc;
       ed->info = info.get();
-      enums_[ed->name] = info.get();
+      pkg_->enums[ed->name] = info.get();
       prog_.enumInfos.push_back(std::move(info));
     }
     for (auto &sd : prog_.structs) {
+      enter(sd->loc);
       if (typeNameTaken(sd->name)) {
         error(sd->loc, "type '" + sd->name + "' is already defined");
         continue;
       }
       auto info = std::make_unique<StructInfo>();
+      info->pkg = pkg_;
       info->name = sd->name;
       info->loc = sd->loc;
       sd->info = info.get();
-      structs_[sd->name] = info.get();
+      pkg_->structs[sd->name] = info.get();
       prog_.structInfos.push_back(std::move(info));
     }
     for (auto &sd : prog_.structs) {
       if (!sd->info)
         continue;
+      enter(sd->loc);
       for (auto &f : sd->fields) {
         Type *ty = resolveType(*f.type);
         if (!ty)
@@ -269,6 +345,7 @@ private:
     for (auto &ed : prog_.enums) {
       if (!ed->info)
         continue;
+      enter(ed->loc);
       EnumInfo *en = ed->info;
       for (auto &vd : ed->variants) {
         if (en->variantIndex.count(vd.name)) {
@@ -287,9 +364,9 @@ private:
           v.fields.push_back(ft ? ft : tc_.intTy());
         }
         en->variantIndex[v.name] = (int)en->variants.size();
-        auto it = variants_.find(v.name);
-        if (it == variants_.end())
-          variants_[v.name] = {en, (int)en->variants.size()};
+        auto it = pkg_->variants.find(v.name);
+        if (it == pkg_->variants.end())
+          pkg_->variants[v.name] = {en, (int)en->variants.size()};
         else
           it->second.first = nullptr; // ambiguous: needs `Enum.Variant`
         en->variants.push_back(std::move(v));
@@ -361,7 +438,9 @@ private:
 
   void declareFuncs() {
     for (auto &fd : prog_.funcs) {
+      enter(fd->loc);
       auto info = std::make_unique<FuncInfo>();
+      info->pkg = pkg_;
       info->name = fd->name;
       info->loc = fd->loc;
       info->decl = fd.get();
@@ -405,8 +484,15 @@ private:
       if (!ok)
         continue;
 
+      // Symbols: co.[<package path>.][<type>.]<name>
+      std::string prefix = "co." + (pkg_->isMain() ? "" : pkg_->path + ".");
       if (info->recvStruct) {
         StructInfo *st = info->recvStruct;
+        if (st->pkg != pkg_) {
+          error(fd->receiver->loc, "cannot define methods on '" + tc_.structTy(st)->str() +
+                                       "', which belongs to another package");
+          continue;
+        }
         if (st->methods.count(fd->name)) {
           error(fd->loc, "method '" + fd->name + "' is already defined for '" + st->name + "'");
           continue;
@@ -415,32 +501,32 @@ private:
           error(fd->loc, "'" + st->name + "' has both a field and a method named '" + fd->name + "'");
           continue;
         }
-        info->symbol = "co." + st->name + "." + fd->name;
+        info->symbol = prefix + st->name + "." + fd->name;
         st->methods[fd->name] = info.get();
       } else {
         if (kBuiltins.count(fd->name)) {
           error(fd->loc, "cannot redefine builtin function '" + fd->name + "'");
           continue;
         }
-        if (funcs_.count(fd->name)) {
+        if (pkg_->funcs.count(fd->name)) {
           error(fd->loc, "function '" + fd->name + "' is already defined");
           continue;
         }
-        if (fd->name == "main") {
+        if (fd->name == "main" && pkg_->isMain()) {
           // `func main() !` is allowed: an error returned from main is printed.
           bool fails = info->ret == tc_.result(tc_.voidTy());
           info->symbol = fails ? "co.main" : "co_main";
           if (!info->params.empty() || (info->ret->kind != TypeKind::Void && !fails))
             error(fd->loc, "func main must take no parameters and return nothing (or '!' to allow errors)");
         } else {
-          info->symbol = "co." + fd->name;
+          info->symbol = prefix + fd->name;
         }
-        funcs_[fd->name] = info.get();
+        pkg_->funcs[fd->name] = info.get();
       }
       fd->info = info.get();
       prog_.funcInfos.push_back(std::move(info));
     }
-    if (!funcs_.count("main"))
+    if (!prog_.packages[0]->funcs.count("main"))
       error({1, 1}, "program has no 'func main()'");
   }
 
@@ -677,6 +763,18 @@ private:
   // Resolves a case pattern like `Circle(r, _)`, `Empty`, `some(x)` or `none`
   // against enum `en`. Returns the variant index, or -1. `binds` receives the
   // names (and locations) to bind, "_" for ignored fields.
+  // In `case P.Variant`, may P stand for enum `en`? `Shape`, `geom.Shape`, or just `geom`.
+  bool patternPrefix(Expr *p, EnumInfo *en) {
+    if (const Import *imp = importBase(p))
+      return imp->pkg == en->pkg;
+    if (p->kind == ExprKind::Field) {
+      auto *fe = static_cast<FieldExpr *>(p);
+      const Import *imp = importBase(fe->base.get());
+      return imp && imp->pkg == en->pkg && fe->name == en->name;
+    }
+    return p->kind == ExprKind::Ident && static_cast<IdentExpr *>(p)->name == en->name && en->pkg == pkg_;
+  }
+
   int resolvePattern(Expr *e, EnumInfo *en, std::vector<std::pair<std::string, SourceLoc>> &binds) {
     std::string name;
     std::vector<ExprPtr> *args = nullptr;
@@ -690,8 +788,8 @@ private:
       name = static_cast<IdentExpr *>(callee)->name;
     } else if (callee->kind == ExprKind::Field) {
       auto *fe = static_cast<FieldExpr *>(callee);
-      if (fe->base->kind != ExprKind::Ident || static_cast<IdentExpr *>(fe->base.get())->name != en->name) {
-        error(e->loc, "expected a variant of '" + en->name + "' here");
+      if (!patternPrefix(fe->base.get(), en)) {
+        error(e->loc, "expected a variant of '" + tc_.enumTy(en)->str() + "' here");
         return -1;
       }
       name = fe->name;
@@ -1063,8 +1161,10 @@ private:
         Type *vt = nullptr;
         if (enumConstructor(e, nullptr, id->name, id->loc, nullptr, vt))
           return vt;
-        if (funcs_.count(id->name) || kBuiltins.count(id->name))
+        if (pkg_->funcs.count(id->name) || kBuiltins.count(id->name))
           error(id->loc, "function '" + id->name + "' can only be called");
+        else if (findImport(id->name))
+          error(id->loc, "package '" + id->name + "' can only be used as '" + id->name + ".Name'");
         else
           error(id->loc, "undefined: '" + id->name + "'");
         return nullptr;
@@ -1083,6 +1183,12 @@ private:
       if (EnumInfo *en = enumPrefix(fe->base.get()))
         if (enumConstructor(e, en, fe->name, fe->loc, nullptr, vt))
           return vt;
+      if (const Import *imp = importBase(fe->base.get())) {
+        if (EnumInfo *en = qualifiedVariant(*imp, fe->name, fe->loc))
+          if (enumConstructor(e, en, fe->name, fe->loc, nullptr, vt))
+            return vt;
+        return nullptr;
+      }
       Type *bt = check(fe->base);
       if (!bt)
         return nullptr;
@@ -1100,6 +1206,8 @@ private:
           error(fe->loc, "struct '" + st->st->name + "' has no field '" + fe->name + "'");
         return nullptr;
       }
+      if (!visible(st->st->pkg, fe->name, "field", fe->loc))
+        return nullptr;
       fe->index = it->second;
       return st->st->fields[fe->index].type;
     }
@@ -1139,14 +1247,12 @@ private:
     }
     case ExprKind::StructLit: {
       auto *sl = static_cast<StructLitExpr *>(e.get());
-      auto it = structs_.find(sl->name);
-      if (it == structs_.end()) {
-        error(sl->loc, "unknown struct type '" + sl->name + "'");
+      sl->st = structLitType(*sl);
+      if (!sl->st) {
         for (auto &f : sl->fields)
           check(f.value);
         return nullptr;
       }
-      sl->st = it->second;
       std::unordered_set<std::string> seen;
       for (auto &f : sl->fields) {
         Type *vt = check(f.value);
@@ -1159,6 +1265,8 @@ private:
           error(f.loc, "field '" + f.name + "' is given twice");
           continue;
         }
+        if (!visible(sl->st->pkg, f.name, "field", f.loc))
+          continue;
         f.index = fi->second;
         if (vt)
           coerce(f.value, sl->st->fields[f.index].type);
@@ -1384,15 +1492,76 @@ private:
     return nullptr;
   }
 
-  // `Shape.Circle`: is `e` the name of an enum type (and not a variable)?
+  // `Shape.Circle` / `geom.Shape.Circle`: does `e` name an enum type (and not a variable)?
   EnumInfo *enumPrefix(Expr *e) {
+    if (e->kind == ExprKind::Field) {
+      auto *fe = static_cast<FieldExpr *>(e);
+      const Import *imp = importBase(fe->base.get());
+      if (!imp || !imp->pkg)
+        return nullptr;
+      auto it = imp->pkg->enums.find(fe->name);
+      if (it == imp->pkg->enums.end() || !visible(imp->pkg, fe->name, "type", fe->loc))
+        return nullptr;
+      return it->second;
+    }
     if (e->kind != ExprKind::Ident)
       return nullptr;
     auto *id = static_cast<IdentExpr *>(e);
     if (lookup(id->name))
       return nullptr;
-    auto it = enums_.find(id->name);
-    return it == enums_.end() ? nullptr : it->second;
+    auto it = pkg_->enums.find(id->name);
+    return it == pkg_->enums.end() ? nullptr : it->second;
+  }
+
+  // Is `e` the name of an imported package (as in `geom.Name`)?
+  const Import *importBase(Expr *e) {
+    return e->kind == ExprKind::Ident ? findImport(static_cast<IdentExpr *>(e)->name) : nullptr;
+  }
+
+  // `geom.Circle`: the enum of an imported package's variant, or null after an error.
+  EnumInfo *qualifiedVariant(const Import &imp, const std::string &name, SourceLoc loc) {
+    if (!imp.pkg)
+      return nullptr;
+    auto it = imp.pkg->variants.find(name);
+    if (it == imp.pkg->variants.end()) {
+      if (imp.pkg->funcs.count(name))
+        error(loc, "function '" + imp.name + "." + name + "' can only be called");
+      else if (imp.pkg->structs.count(name) || imp.pkg->enums.count(name))
+        error(loc, "'" + imp.name + "." + name + "' is a type, not a value");
+      else
+        error(loc, "package " + imp.name + " has no '" + name + "'");
+      return nullptr;
+    }
+    EnumInfo *en = it->second.first;
+    if (!en) {
+      error(loc, "'" + name + "' is a variant of several enums in package " + imp.name + "; write '" + imp.name +
+                     ".EnumName." + name + "'");
+      return nullptr;
+    }
+    return visible(imp.pkg, en->name, "type", loc) ? en : nullptr;
+  }
+
+  StructInfo *structLitType(StructLitExpr &sl) {
+    if (sl.pkg.empty()) {
+      auto it = pkg_->structs.find(sl.name);
+      if (it == pkg_->structs.end()) {
+        error(sl.loc, "unknown struct type '" + sl.name + "'");
+        return nullptr;
+      }
+      return it->second;
+    }
+    const Import *imp = findImport(sl.pkg);
+    if (!imp) {
+      error(sl.loc, "unknown package '" + sl.pkg + "' (missing import \"" + sl.pkg + "\"?)");
+      return nullptr;
+    }
+    StructInfo *st;
+    EnumInfo *en;
+    if (!qualifiedType(*imp, sl.name, sl.loc, st, en))
+      return nullptr;
+    if (!st)
+      error(sl.loc, "'" + sl.pkg + "." + sl.name + "' is an enum, not a struct");
+    return st;
   }
 
   // Tries to build an enum value from `name` (a variant of `en`, or an
@@ -1410,8 +1579,8 @@ private:
       }
       vi = it->second;
     } else {
-      auto it = variants_.find(name);
-      if (it == variants_.end())
+      auto it = pkg_->variants.find(name);
+      if (it == pkg_->variants.end())
         return false;
       if (!it->second.first) {
         error(loc, "'" + name + "' is a variant of several enums; write 'EnumName." + name + "'");
@@ -1453,11 +1622,13 @@ private:
         enumConstructor(self, en, name, fe->loc, &c.args, vt);
         return vt;
       }
+      if (const Import *imp = importBase(fe->base.get()))
+        return checkQualifiedCall(c, self, *imp);
       return checkMethodCall(c);
     }
     if (c.callee->kind == ExprKind::Ident) {
       auto *id = static_cast<IdentExpr *>(c.callee.get());
-      if (!lookup(id->name) && !kBuiltins.count(id->name) && !funcs_.count(id->name)) {
+      if (!lookup(id->name) && !kBuiltins.count(id->name) && !pkg_->funcs.count(id->name)) {
         if (id->name == "some") {
           if (c.args.size() != 1) {
             error(c.loc, "some(x) takes one value");
@@ -1495,8 +1666,8 @@ private:
       c.builtin = bi->second;
       return checkBuiltin(c);
     }
-    auto fi = funcs_.find(id->name);
-    if (fi == funcs_.end()) {
+    auto fi = pkg_->funcs.find(id->name);
+    if (fi == pkg_->funcs.end()) {
       error(id->loc, "undefined function '" + id->name + "'");
       for (auto &a : c.args)
         check(a);
@@ -1509,6 +1680,29 @@ private:
     }
     checkArgs(c, 0);
     return c.func->ret;
+  }
+
+  // `geom.Dist(p)` or `geom.Circle(1.0)`.
+  Type *checkQualifiedCall(CallExpr &c, ExprPtr &self, const Import &imp) {
+    auto *fe = static_cast<FieldExpr *>(c.callee.get());
+    std::string name = fe->name;
+    if (imp.pkg) {
+      auto fi = imp.pkg->funcs.find(name);
+      if (fi != imp.pkg->funcs.end()) {
+        if (visible(imp.pkg, name, "function", fe->loc)) {
+          c.func = fi->second;
+          checkArgs(c, 0);
+          return c.func->ret;
+        }
+      } else if (EnumInfo *en = qualifiedVariant(imp, name, fe->loc)) {
+        Type *vt = nullptr;
+        enumConstructor(self, en, name, fe->loc, &c.args, vt);
+        return vt;
+      }
+    }
+    for (auto &a : c.args)
+      check(a);
+    return nullptr;
   }
 
   // Checks c.args[first..] against c.func->params[first..].
@@ -1547,6 +1741,11 @@ private:
     }
     if (!m) {
       error(fe->loc, "type '" + bt->str() + "' has no method '" + fe->name + "'");
+      for (auto &a : c.args)
+        check(a);
+      return nullptr;
+    }
+    if (!visible(m->pkg, m->name, "method", fe->loc)) {
       for (auto &a : c.args)
         check(a);
       return nullptr;

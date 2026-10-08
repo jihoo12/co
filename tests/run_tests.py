@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Runs the co test suite.
 
-Each tests/*.co file declares its expectations in comments:
+Each tests/*.co file is a program; so is each tests/<dir>/ with a main.co,
+built as a whole directory (its packages live in subdirectories). A test's
+.co file (main.co for directories) declares its expectations in comments:
   // expect: <line>      expected stdout line (in order)
   // error: <substring>  expected compile error (the file must fail to compile)
   // exit: <code>        expected exit code (default 0)
@@ -31,8 +33,9 @@ def parse(path):
 
 
 def run_one(coc, path, tmp):
-    exp = parse(path)
-    out = os.path.join(tmp, os.path.basename(path)[:-3])
+    is_dir = os.path.isdir(path)
+    exp = parse(os.path.join(path, "main.co") if is_dir else path)
+    out = os.path.join(tmp, os.path.basename(path).removesuffix(".co"))
     build = subprocess.run([coc, "build", path, "-o", out], capture_output=True, text=True)
     if exp["error"]:
         if build.returncode == 0:
@@ -60,7 +63,8 @@ def run_one(coc, path, tmp):
 
 def main():
     coc, test_dir = sys.argv[1], sys.argv[2]
-    files = sorted(f for f in os.listdir(test_dir) if f.endswith(".co"))
+    files = sorted(f for f in os.listdir(test_dir)
+                   if f.endswith(".co") or os.path.exists(os.path.join(test_dir, f, "main.co")))
     failed = 0
     with tempfile.TemporaryDirectory() as tmp:
         for name in files:

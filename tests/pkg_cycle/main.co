@@ -1,0 +1,10 @@
+// error: import cycle: package "a" imports itself
+// error: cannot find package "missing"
+// error: invalid import path "../up"
+import (
+    "a"
+    "missing"
+    "../up"
+)
+
+func main() { println(a.A()) }
