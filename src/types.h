@@ -14,23 +14,34 @@ struct EnumInfo;
 struct FuncInfo;
 struct Package;
 
-// `None` is the type of the `none` literal before it is converted to some `?T`.
+// `None` is the type of the `none` literal before it is converted to some `?T`,
+// and `Nil` that of `nil` before it becomes a C pointer `*T`. `IntN` are the
+// sized integers (int8 ... uint64; `int` itself is Int), and `Ptr` is a raw C
+// pointer, which is not borrow-checked and only meant for talking to C.
 // Optionals `?T` are enums with variants `none` and `some(T)`; results `!T`
 // are enums with variants `ok(T)` and `err(error)`. `error` holds a message.
-enum class TypeKind { Void, Int, Float, Bool, String, Error, Struct, Enum, Ref, Slice, Map, None };
+enum class TypeKind { Void, Int, Float, Bool, String, Error, Struct, Enum, Ref, Slice, Map, None, IntN, Float32, Ptr, Nil };
 
 // Types are interned by TypeContext, so they can be compared by pointer.
 struct Type {
   TypeKind kind;
   bool mut = false;       // for Ref: &mut T
-  Type *inner = nullptr;  // for Ref and Slice; the value type of a Map
+  int bits = 64;          // for IntN
+  bool isUnsigned = false; // for IntN
+  Type *inner = nullptr;  // for Ref, Slice and Ptr; the value type of a Map
   Type *key = nullptr;    // for Map
   StructInfo *st = nullptr;
   EnumInfo *en = nullptr;
 
   bool isRef() const { return kind == TypeKind::Ref; }
   bool isMutRef() const { return kind == TypeKind::Ref && mut; }
-  bool isNumeric() const { return kind == TypeKind::Int || kind == TypeKind::Float; }
+  bool isInteger() const { return kind == TypeKind::Int || kind == TypeKind::IntN; }
+  bool isFloat() const { return kind == TypeKind::Float || kind == TypeKind::Float32; }
+  bool isNumeric() const { return isInteger() || isFloat(); }
+  bool isSigned() const { return kind == TypeKind::Int || (kind == TypeKind::IntN && !isUnsigned); }
+  bool isPtr() const { return kind == TypeKind::Ptr; }
+  // Can C see this type as is? Numbers, bool, pointers, and structs of those.
+  bool isCCompatible() const;
   // Values of Copy types are duplicated on use; everything else is moved.
   bool isCopy() const;
   // Types that own heap memory and must be freed when they go out of scope.
@@ -100,9 +111,17 @@ public:
   Type *noneTy() { return &none_; }
   Type *errorTy() { return &error_; }
   Type *result(Type *inner);
+  Type *intN(int bits, bool isUnsigned); // intN(64, false) is int
+  Type *float32Ty() { return &float32_; }
+  Type *ptr(Type *inner);
+  Type *nilTy() { return &nil_; }
+  // The numeric type named `name` (int, uint8, byte, float32, ...), or null.
+  Type *numericByName(const std::string &name);
 
 private:
-  Type void_, int_, float_, bool_, string_, none_, error_;
+  Type void_, int_, float_, bool_, string_, none_, error_, float32_, nil_;
+  std::map<std::pair<int, bool>, std::unique_ptr<Type>> intNs_;
+  std::map<Type *, std::unique_ptr<Type>> ptrs_;
   std::map<std::pair<Type *, bool>, std::unique_ptr<Type>> refs_;
   std::map<Type *, std::unique_ptr<Type>> slices_;
   std::map<std::pair<Type *, Type *>, std::unique_ptr<Type>> maps_;

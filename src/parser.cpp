@@ -1,5 +1,8 @@
 #include "parser.h"
 
+#include <algorithm>
+#include <cctype>
+
 namespace co {
 namespace {
 
@@ -25,9 +28,12 @@ public:
           parseTypeDecl(prog_);
         } else if (at(Tok::KwFunc)) {
           declared = true;
-          prog_.funcs.push_back(parseFuncDecl());
+          prog_.funcs.push_back(parseFuncDecl(false));
+        } else if (at(Tok::KwExtern)) {
+          declared = true;
+          parseExtern();
         } else {
-          fail("expected 'func' or 'type' declaration, found " + describe(cur()));
+          fail("expected 'func', 'type' or 'extern' declaration, found " + describe(cur()));
         }
       } catch (ParseError &) {
         recoverTopLevel();
@@ -89,7 +95,7 @@ private:
   }
   void recoverTopLevel() {
     while (!at(Tok::Eof)) {
-      if ((at(Tok::KwFunc) || at(Tok::KwType) || at(Tok::KwImport)) && pos_ > 0 &&
+      if ((at(Tok::KwFunc) || at(Tok::KwType) || at(Tok::KwImport) || at(Tok::KwExtern)) && pos_ > 0 &&
           toks_[pos_ - 1].kind == Tok::Semi)
         return;
       next();
@@ -124,6 +130,37 @@ private:
     file_.imports.push_back(std::move(imp));
   }
 
+  // ----- extern -----
+
+  // `extern "lib" { func name(params) ret ... }`: C functions, from library
+  // `lib` (linked as -llib) or, without a name, from the C library.
+  void parseExtern() {
+    expect(Tok::KwExtern);
+    if (at(Tok::String)) {
+      SourceLoc l = loc();
+      std::string lib = next().text;
+      bool ok = !lib.empty();
+      for (char c : lib)
+        ok &= isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.' || c == '+';
+      if (!ok)
+        diag_.error(l, "invalid library name \"" + lib + "\" (write the name you'd pass to -l, like \"sqlite3\")");
+      else if (std::find(prog_.libs.begin(), prog_.libs.end(), lib) == prog_.libs.end())
+        prog_.libs.push_back(lib);
+    }
+    expect(Tok::LBrace, "to start the extern block");
+    skipSemis();
+    while (!at(Tok::RBrace)) {
+      if (!at(Tok::KwFunc))
+        fail("expected a C function declaration ('func name(params) type') in the extern block, found " +
+             describe(cur()));
+      prog_.funcs.push_back(parseFuncDecl(true));
+      if (!at(Tok::RBrace))
+        expect(Tok::Semi, "after the function declaration");
+      skipSemis();
+    }
+    expect(Tok::RBrace, "to end the extern block");
+  }
+
   // ----- types -----
 
   TypeExprPtr parseType() {
@@ -143,6 +180,11 @@ private:
     if (accept(Tok::Amp)) {
       t->kind = TypeExpr::Ref;
       t->mut = accept(Tok::KwMut);
+      t->inner = parseType();
+      return t;
+    }
+    if (accept(Tok::Star)) {
+      t->kind = TypeExpr::Ptr;
       t->inner = parseType();
       return t;
     }
@@ -302,9 +344,14 @@ private:
     return c;
   }
 
-  std::unique_ptr<FuncDecl> parseFuncDecl() {
+  // An extern declaration has no receiver and no body, and may end its
+  // parameters with `...` (a variadic C function).
+  std::unique_ptr<FuncDecl> parseFuncDecl(bool isExtern) {
     expect(Tok::KwFunc);
     auto fd = std::make_unique<FuncDecl>();
+    fd->isExtern = isExtern;
+    if (isExtern && at(Tok::LParen))
+      fail("C functions cannot have receivers");
     if (accept(Tok::LParen)) {
       Param recv;
       recv.loc = loc();
@@ -320,6 +367,10 @@ private:
     std::vector<std::pair<std::string, SourceLoc>> pending;
     while (!at(Tok::RParen)) {
       SourceLoc l = loc();
+      if (isExtern && pending.empty() && accept(Tok::Ellipsis)) {
+        fd->variadic = true;
+        break;
+      }
       std::string name = expect(Tok::Ident, "for parameter name").text;
       pending.push_back({name, l});
       if (at(Tok::Comma) || at(Tok::RParen)) {
@@ -340,7 +391,12 @@ private:
       if (!accept(Tok::Comma))
         break;
     }
-    expect(Tok::RParen, "after parameters");
+    expect(Tok::RParen, fd->variadic ? "after '...' (it must come last)" : "after parameters");
+    if (isExtern) {
+      if (!at(Tok::Semi) && !at(Tok::RBrace))
+        fd->ret = parseType();
+      return fd;
+    }
     if (!at(Tok::LBrace))
       fd->ret = parseType();
     fd->body = parseBlock();
@@ -689,6 +745,9 @@ private:
     case Tok::KwNone:
       next();
       return std::make_unique<NoneLitExpr>(l);
+    case Tok::KwNil:
+      next();
+      return std::make_unique<NilLitExpr>(l);
     case Tok::LParen: {
       next();
       bool saved = noStructLit_;

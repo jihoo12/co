@@ -68,6 +68,8 @@ void co_free(void *p) {
 // ----- printing -----
 
 void co_print_int(int64_t v) { printf("%" PRId64, v); }
+void co_print_uint(uint64_t v) { printf("%" PRIu64, v); }
+void co_print_ptr(const void *p) { printf("%p", p); }
 void co_print_float(double v) { printf("%g", v); }
 void co_print_bool(int32_t v) { fputs(v ? "true" : "false", stdout); }
 void co_print_str(const CoVec *s) { fwrite(s->ptr, 1, (size_t)s->len, stdout); }
@@ -111,6 +113,30 @@ void co_str_from_int(CoVec *out, int64_t v) {
   char buf[32];
   int n = snprintf(buf, sizeof buf, "%" PRId64, v);
   str_from(out, buf, n);
+}
+
+void co_str_from_uint(CoVec *out, uint64_t v) {
+  char buf[32];
+  int n = snprintf(buf, sizeof buf, "%" PRIu64, v);
+  str_from(out, buf, n);
+}
+
+// cstr(p): copies a NUL-terminated C string; a null pointer gives "".
+void co_str_from_cstr(CoVec *out, const char *p) { str_from(out, p, p ? (int64_t)strlen(p) : 0); }
+
+// A NUL-terminated copy of `s` for a call to C: in `buf` (of `size` bytes)
+// when it fits, else on the heap. co_cstr_end releases it after the call.
+char *co_cstr_begin(const CoVec *s, char *buf, int64_t size) {
+  char *p = s->len < size ? buf : xrealloc(NULL, (size_t)s->len + 1);
+  if (s->len)
+    memcpy(p, s->ptr, (size_t)s->len);
+  p[s->len] = 0;
+  return p;
+}
+
+void co_cstr_end(char *p, char *buf) {
+  if (p != buf)
+    co_free(p);
 }
 
 void co_str_from_float(CoVec *out, double v) {

@@ -37,6 +37,8 @@ enum class Tok {
   KwTry,
   KwMap,
   KwImport,
+  KwExtern,
+  KwNil,
   // punctuation
   LParen,
   RParen,
@@ -46,6 +48,7 @@ enum class Tok {
   RBracket,
   Comma,
   Dot,
+  Ellipsis,
   Colon,
   Semi,
   Question,

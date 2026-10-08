@@ -237,6 +237,13 @@ private:
       o.type = e->type;
       return o;
     }
+    case ExprKind::NilLit: {
+      Operand o;
+      o.kind = Operand::Const;
+      o.c.kind = Constant::Zero; // a null pointer
+      o.type = e->type;
+      return o;
+    }
     default:
       if (isPlaceExpr(e))
         return useOf(lowerPlace(e), e->type, e->loc);
@@ -497,6 +504,7 @@ private:
     case ExprKind::IntLit:
     case ExprKind::FloatLit:
     case ExprKind::BoolLit:
+    case ExprKind::NilLit:
       assign(dest, use(lowerOperand(e)), loc);
       return;
     case ExprKind::StrLit: {
@@ -696,8 +704,8 @@ private:
       case Builtin::Len: rv.builtin = BuiltinOp::Len; break;
       case Builtin::Append: rv.builtin = BuiltinOp::Append; break;
       case Builtin::Clone: rv.builtin = BuiltinOp::Clone; break;
-      case Builtin::ToInt: rv.builtin = BuiltinOp::ToInt; break;
-      case Builtin::ToFloat: rv.builtin = BuiltinOp::ToFloat; break;
+      case Builtin::Convert: rv.builtin = BuiltinOp::Convert; break;
+      case Builtin::CStr: rv.builtin = BuiltinOp::CStr; break;
       case Builtin::ToStr: rv.builtin = BuiltinOp::ToStr; break;
       case Builtin::Panic: rv.builtin = BuiltinOp::Panic; break;
       case Builtin::MakeError: rv.builtin = BuiltinOp::MakeError; break;
@@ -713,6 +721,8 @@ private:
     rv.ops.resize(c->args.size());
     size_t first = c->receiverLast ? 1 : 0;
     auto note = [&](size_t i) {
+      if (i >= c->func->params.size()) // variadic C arguments
+        return std::string();
       Type *t = c->func->params[i];
       if (t->isCopy() || c->args[i]->kind != ExprKind::Ident)
         return std::string();
@@ -813,9 +823,10 @@ private:
       Rvalue rv;
       rv.kind = Rvalue::BinaryOp;
       rv.bop = st.inc ? BinOp::Add : BinOp::Sub;
-      rv.type = tc_.intTy();
-      rv.ops.push_back(copyOf(p, tc_.intTy()));
-      rv.ops.push_back(constInt(1, tc_.intTy()));
+      Type *ty = st.target->type; // int or a sized integer
+      rv.type = ty;
+      rv.ops.push_back(copyOf(p, ty));
+      rv.ops.push_back(constInt(1, ty));
       assign(p, std::move(rv), st.loc);
       return;
     }
@@ -1186,7 +1197,7 @@ private:
 mir::Module buildMir(Program &prog, TypeContext &tc, Diagnostics &diag) {
   mir::Module m;
   for (auto &fd : prog.funcs) {
-    if (!fd->info)
+    if (!fd->info || fd->isExtern)
       continue;
     FnBuilder b(*fd, tc, diag);
     m.funcs.push_back(b.build());

@@ -35,6 +35,7 @@ static void usage() {
           "options:\n"
           "  -o <path>      output executable (default: file name without .co, or the directory's name)\n"
           "  -O0 .. -O3     optimization level (default -O2)\n"
+          "  -L <dir>       also look for C libraries (extern \"lib\") in <dir>\n"
           "  --emit-llvm    also write <output>.ll\n"
           "  --emit-mir     print the MIR to stdout\n");
 }
@@ -65,10 +66,15 @@ int main(int argc, char **argv) {
   std::string output;
   CodegenOptions opts;
   bool emitLLVM = false, emitMir = false;
+  LinkLibs libs;
   for (int i = 3; i < argc; i++) {
     std::string a = argv[i];
     if (a == "-o" && i + 1 < argc)
       output = argv[++i];
+    else if (a == "-L" && i + 1 < argc)
+      libs.dirs.push_back(argv[++i]);
+    else if (a.size() > 2 && a.compare(0, 2, "-L") == 0)
+      libs.dirs.push_back(a.substr(2));
     else if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '3')
       opts.optLevel = a[2] - '0';
     else if (a == "--emit-llvm")
@@ -155,7 +161,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  bool linked = link(plan, std::string(obj), output, err);
+  libs.libs = prog->libs;
+  bool linked = link(plan, std::string(obj), output, libs, err);
   llvm::sys::fs::remove(obj);
   if (!linked) {
     fprintf(stderr, "coc: %s\n", err.c_str());

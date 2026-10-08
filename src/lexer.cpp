@@ -35,6 +35,8 @@ const char *tokName(Tok t) {
   case Tok::KwTry: return "'try'";
   case Tok::KwMap: return "'map'";
   case Tok::KwImport: return "'import'";
+  case Tok::KwExtern: return "'extern'";
+  case Tok::KwNil: return "'nil'";
   case Tok::Question: return "'?'";
   case Tok::LParen: return "'('";
   case Tok::RParen: return "')'";
@@ -44,6 +46,7 @@ const char *tokName(Tok t) {
   case Tok::RBracket: return "']'";
   case Tok::Comma: return "','";
   case Tok::Dot: return "'.'";
+  case Tok::Ellipsis: return "'...'";
   case Tok::Colon: return "':'";
   case Tok::Semi: return "';' or newline";
   case Tok::Plus: return "'+'";
@@ -86,6 +89,7 @@ static bool endsStatement(Tok t) {
   case Tok::KwTrue:
   case Tok::KwFalse:
   case Tok::KwNone:
+  case Tok::KwNil:
   case Tok::RParen:
   case Tok::RBracket:
   case Tok::RBrace:
@@ -107,6 +111,7 @@ std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag) {
       {"enum", Tok::KwEnum},     {"switch", Tok::KwSwitch}, {"case", Tok::KwCase},
       {"default", Tok::KwDefault}, {"none", Tok::KwNone},  {"or", Tok::KwOr},
       {"try", Tok::KwTry},       {"map", Tok::KwMap},     {"import", Tok::KwImport},
+      {"extern", Tok::KwExtern}, {"nil", Tok::KwNil},
   };
 
   std::vector<Token> toks;
@@ -282,7 +287,15 @@ std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag) {
     case '[': advance(); tok.kind = Tok::LBracket; break;
     case ']': advance(); tok.kind = Tok::RBracket; break;
     case ',': advance(); tok.kind = Tok::Comma; break;
-    case '.': advance(); tok.kind = Tok::Dot; break;
+    case '.':
+      advance();
+      tok.kind = Tok::Dot;
+      if (peek() == '.' && peek(1) == '.') {
+        advance();
+        advance();
+        tok.kind = Tok::Ellipsis;
+      }
+      break;
     case ';': advance(); tok.kind = Tok::Semi; break;
     case '?': advance(); tok.kind = Tok::Question; break;
     case ':': tok.kind = two('=', Tok::Define, Tok::Colon); break;

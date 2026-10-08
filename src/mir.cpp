@@ -90,8 +90,8 @@ static const char *builtinStr(BuiltinOp b) {
   case BuiltinOp::Append: return "append";
   case BuiltinOp::Push: return "push";
   case BuiltinOp::Clone: return "clone";
-  case BuiltinOp::ToInt: return "int";
-  case BuiltinOp::ToFloat: return "float";
+  case BuiltinOp::Convert: return "convert";
+  case BuiltinOp::CStr: return "cstr";
   case BuiltinOp::ToStr: return "str";
   case BuiltinOp::Panic: return "panic";
   case BuiltinOp::StrLit: return "str_lit";

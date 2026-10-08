@@ -74,7 +74,7 @@ LinkPlan planLink() {
   return plan;
 }
 
-static bool linkWithCC(const std::string &obj, const std::string &out, std::string &error) {
+static bool linkWithCC(const std::string &obj, const std::string &out, const LinkLibs &libs, std::string &error) {
   const char *ccEnv = getenv("CO_CC");
   std::string ccName = ccEnv ? ccEnv : CO_DEFAULT_CC;
   auto cc = llvm::sys::findProgramByName(ccName);
@@ -82,7 +82,14 @@ static bool linkWithCC(const std::string &obj, const std::string &out, std::stri
     error = "cannot find C compiler '" + ccName + "' for linking (set CO_CC)";
     return false;
   }
-  std::vector<std::string> args = {*cc, obj, "-o", out, "-lm"};
+  std::vector<std::string> args = {*cc, obj, "-o", out};
+  for (auto &d : libs.dirs) {
+    args.push_back("-L" + d);
+    args.push_back("-Wl,-rpath," + d);
+  }
+  for (auto &l : libs.libs)
+    args.push_back("-l" + l);
+  args.push_back("-lm");
   if (const char *extra = getenv("CO_LDFLAGS")) {
     std::istringstream flags(extra);
     for (std::string f; flags >> f;)
@@ -98,16 +105,32 @@ static bool linkWithCC(const std::string &obj, const std::string &out, std::stri
   return true;
 }
 
-bool link(const LinkPlan &plan, const std::string &obj, const std::string &out, std::string &error) {
+bool link(const LinkPlan &plan, const std::string &obj, const std::string &out, const LinkLibs &libs,
+          std::string &error) {
   if (!plan.builtin)
-    return linkWithCC(obj, out, error);
+    return linkWithCC(obj, out, libs, error);
 #if CO_BUILTIN_LINKER
-  std::vector<const char *> args = {"ld.lld", "-pie", "-z", "relro", "-z", "now", "--eh-frame-hdr",
-                                    "--hash-style=gnu", "--as-needed", "--dynamic-linker", plan.interp.c_str(),
-                                    "-o", out.c_str(), obj.c_str(), plan.libc.c_str()};
+  std::vector<std::string> args = {"ld.lld", "-pie", "-z", "relro", "-z", "now", "--eh-frame-hdr",
+                                   "--hash-style=gnu", "--as-needed", "--dynamic-linker", plan.interp,
+                                   "-o", out, obj, plan.libc};
+  if (!libs.libs.empty()) {
+    // -l searches the given directories, then the C library's, then the usual system ones.
+    for (auto &d : libs.dirs)
+      args.insert(args.end(), {"-L", d, "-rpath", d});
+    args.insert(args.end(), {"-L", llvm::sys::path::parent_path(plan.libc).str()});
+    for (const char *d : {"/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib64",
+                          "/lib64", "/usr/lib", "/lib"})
+      if (llvm::sys::fs::is_directory(d))
+        args.insert(args.end(), {"-L", d});
+    for (auto &l : libs.libs)
+      args.push_back("-l" + l);
+  }
+  std::vector<const char *> argv;
+  for (auto &a : args)
+    argv.push_back(a.c_str());
   std::string msgs;
   llvm::raw_string_ostream os(msgs);
-  lld::Result r = lld::lldMain(args, os, os, {{lld::Gnu, &lld::elf::link}});
+  lld::Result r = lld::lldMain(argv, os, os, {{lld::Gnu, &lld::elf::link}});
   if (r.retCode != 0) {
     error = "linking failed:\n" + msgs;
     return false;

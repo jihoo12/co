@@ -15,6 +15,10 @@ bool Type::isCopy() const {
   case TypeKind::Int:
   case TypeKind::Float:
   case TypeKind::Bool:
+  case TypeKind::IntN:
+  case TypeKind::Float32:
+  case TypeKind::Ptr:
+  case TypeKind::Nil:
     return true;
   case TypeKind::Ref:
     return !mut; // shared references can be freely copied; &mut is unique
@@ -34,6 +38,25 @@ bool Type::isCopy() const {
     return true;
   }
   return false;
+}
+
+bool Type::isCCompatible() const {
+  switch (kind) {
+  case TypeKind::Int:
+  case TypeKind::Float:
+  case TypeKind::Bool:
+  case TypeKind::IntN:
+  case TypeKind::Float32:
+  case TypeKind::Ptr:
+    return true;
+  case TypeKind::Struct:
+    for (auto &f : st->fields)
+      if (!f.type->isCCompatible())
+        return false;
+    return true;
+  default:
+    return false;
+  }
 }
 
 bool Type::isOptional() const { return kind == TypeKind::Enum && en->optionalOf; }
@@ -78,6 +101,10 @@ std::string Type::str() const {
   case TypeKind::Struct: return qualified(st->pkg, st->name);
   case TypeKind::Enum: return qualified(en->pkg, en->name);
   case TypeKind::None: return "none";
+  case TypeKind::Nil: return "nil";
+  case TypeKind::Float32: return "float32";
+  case TypeKind::IntN: return (isUnsigned ? "uint" : "int") + std::to_string(bits);
+  case TypeKind::Ptr: return "*" + inner->str();
   case TypeKind::Ref: return (mut ? "&mut " : "&") + inner->str();
   case TypeKind::Slice: return "[]" + inner->str();
   case TypeKind::Map: return "map[" + key->str() + "]" + inner->str();
@@ -93,6 +120,43 @@ TypeContext::TypeContext() {
   string_.kind = TypeKind::String;
   none_.kind = TypeKind::None;
   error_.kind = TypeKind::Error;
+  float32_.kind = TypeKind::Float32;
+  nil_.kind = TypeKind::Nil;
+}
+
+Type *TypeContext::intN(int bits, bool isUnsigned) {
+  if (bits == 64 && !isUnsigned)
+    return &int_;
+  auto &slot = intNs_[{bits, isUnsigned}];
+  if (!slot) {
+    slot = std::make_unique<Type>();
+    slot->kind = TypeKind::IntN;
+    slot->bits = bits;
+    slot->isUnsigned = isUnsigned;
+  }
+  return slot.get();
+}
+
+Type *TypeContext::ptr(Type *inner) {
+  auto &slot = ptrs_[inner];
+  if (!slot) {
+    slot = std::make_unique<Type>();
+    slot->kind = TypeKind::Ptr;
+    slot->inner = inner;
+  }
+  return slot.get();
+}
+
+Type *TypeContext::numericByName(const std::string &name) {
+  if (name == "int" || name == "int64") return &int_;
+  if (name == "float" || name == "float64") return &float_;
+  if (name == "float32") return &float32_;
+  if (name == "byte") return intN(8, true);
+  for (int bits : {8, 16, 32, 64}) {
+    if (name == "int" + std::to_string(bits)) return intN(bits, false);
+    if (name == "uint" + std::to_string(bits)) return intN(bits, true);
+  }
+  return nullptr;
 }
 
 Type *TypeContext::result(Type *inner) {

@@ -9,10 +9,26 @@ namespace {
 
 const std::unordered_map<std::string, Builtin> kBuiltins = {
     {"print", Builtin::Print},   {"println", Builtin::Println}, {"len", Builtin::Len},
-    {"append", Builtin::Append}, {"clone", Builtin::Clone},     {"int", Builtin::ToInt},
-    {"float", Builtin::ToFloat}, {"str", Builtin::ToStr},       {"panic", Builtin::Panic},
-    {"error", Builtin::MakeError}, {"delete", Builtin::Delete},
+    {"append", Builtin::Append}, {"clone", Builtin::Clone},     {"str", Builtin::ToStr},
+    {"panic", Builtin::Panic},   {"error", Builtin::MakeError}, {"delete", Builtin::Delete},
+    {"cstr", Builtin::CStr},
+    // Numeric conversions are calls of the type's name: int32(x), float(n), ...
+    {"int", Builtin::Convert},    {"int8", Builtin::Convert},   {"int16", Builtin::Convert},
+    {"int32", Builtin::Convert},  {"int64", Builtin::Convert},  {"uint8", Builtin::Convert},
+    {"uint16", Builtin::Convert}, {"uint32", Builtin::Convert}, {"uint64", Builtin::Convert},
+    {"byte", Builtin::Convert},   {"float", Builtin::Convert},  {"float32", Builtin::Convert},
+    {"float64", Builtin::Convert},
 };
+
+// An integer or float literal, possibly negated: it takes whichever numeric
+// type the context needs (like Go's untyped constants).
+bool isNumericLiteral(const Expr *e) {
+  if (e->kind == ExprKind::IntLit || e->kind == ExprKind::FloatLit)
+    return true;
+  if (e->kind == ExprKind::Unary && static_cast<const UnaryExpr *>(e)->op == UnOp::Neg)
+    return isNumericLiteral(static_cast<const UnaryExpr *>(e)->operand.get());
+  return false;
+}
 
 bool isPlace(const Expr *e) {
   switch (e->kind) {
@@ -126,7 +142,7 @@ public:
     declareFuncs();
     checkImportNames();
     for (auto &fd : prog_.funcs)
-      if (fd->info) {
+      if (fd->info && !fd->isExtern) {
         enter(fd->loc);
         checkFunc(*fd);
       }
@@ -215,6 +231,13 @@ private:
       if (t.name == "bool") return tc_.boolTy();
       if (t.name == "string") return tc_.stringTy();
       if (t.name == "error") return tc_.errorTy();
+      if (t.pkg.empty())
+        if (Type *n = tc_.numericByName(t.name))
+          return n;
+      if (t.name == "void" && t.pkg.empty()) {
+        error(t.loc, "'void' can only be used as '*void', a C pointer to anything");
+        return nullptr;
+      }
       if (!t.pkg.empty()) {
         const Import *imp = findImport(t.pkg);
         if (!imp) {
@@ -273,6 +296,18 @@ private:
       }
       return tc_.ref(inner, t.mut);
     }
+    case TypeExpr::Ptr: {
+      if (t.inner->kind == TypeExpr::Name && t.inner->name == "void" && t.inner->pkg.empty())
+        return tc_.ptr(tc_.voidTy());
+      Type *inner = resolveType(*t.inner);
+      if (!inner)
+        return nullptr;
+      if (inner->isRef()) {
+        error(t.loc, "C pointers cannot point to references");
+        return nullptr;
+      }
+      return tc_.ptr(inner);
+    }
     case TypeExpr::Slice: {
       Type *inner = resolveType(*t.inner);
       if (!inner)
@@ -288,7 +323,7 @@ private:
   }
 
   bool typeNameTaken(const std::string &n) {
-    return pkg_->structs.count(n) || pkg_->enums.count(n) || n == "int" || n == "float" || n == "bool" ||
+    return pkg_->structs.count(n) || pkg_->enums.count(n) || tc_.numericByName(n) || n == "void" || n == "int" || n == "float" || n == "bool" ||
            n == "string" || n == "error";
   }
 
@@ -484,6 +519,17 @@ private:
       if (!ok)
         continue;
 
+      if (fd->isExtern) {
+        if (!checkExternSignature(*fd, *info) || !declareFuncName(*fd, info.get()))
+          continue;
+        info->isExtern = true;
+        info->variadic = fd->variadic;
+        info->symbol = fd->name; // the C name, unmangled
+        fd->info = info.get();
+        prog_.funcInfos.push_back(std::move(info));
+        continue;
+      }
+
       // Symbols: co.[<package path>.][<type>.]<name>
       std::string prefix = "co." + (pkg_->isMain() ? "" : pkg_->path + ".");
       if (info->recvStruct) {
@@ -504,14 +550,8 @@ private:
         info->symbol = prefix + st->name + "." + fd->name;
         st->methods[fd->name] = info.get();
       } else {
-        if (kBuiltins.count(fd->name)) {
-          error(fd->loc, "cannot redefine builtin function '" + fd->name + "'");
+        if (!declareFuncName(*fd, nullptr))
           continue;
-        }
-        if (pkg_->funcs.count(fd->name)) {
-          error(fd->loc, "function '" + fd->name + "' is already defined");
-          continue;
-        }
         if (fd->name == "main" && pkg_->isMain()) {
           // `func main() !` is allowed: an error returned from main is printed.
           bool fails = info->ret == tc_.result(tc_.voidTy());
@@ -528,6 +568,59 @@ private:
     }
     if (!prog_.packages[0]->funcs.count("main"))
       error({1, 1}, "program has no 'func main()'");
+  }
+
+  // Checks that a package-level function name is free; with `info`, also claims it.
+  bool declareFuncName(FuncDecl &fd, FuncInfo *info) {
+    if (kBuiltins.count(fd.name)) {
+      error(fd.loc, "cannot redefine builtin function '" + fd.name + "'");
+      return false;
+    }
+    if (pkg_->funcs.count(fd.name)) {
+      error(fd.loc, "function '" + fd.name + "' is already defined");
+      return false;
+    }
+    if (info)
+      pkg_->funcs[fd.name] = info;
+    return true;
+  }
+
+  // C functions take and return numbers, bool and pointers. Pointers may
+  // point to those, to structs made only of those, or to anything (*void).
+  bool checkExternSignature(FuncDecl &fd, FuncInfo &info) {
+    if (fd.name == "main") {
+      error(fd.loc, "an extern function cannot be called 'main'");
+      return false;
+    }
+    auto scalar = [](Type *t) {
+      return t->isNumeric() || t->kind == TypeKind::Bool || t->isPtr();
+    };
+    auto pointee = [&](Type *t) {
+      for (; t->isPtr(); t = t->inner)
+        if (t->inner->kind != TypeKind::Void && !t->inner->isPtr() && !t->inner->isCCompatible())
+          return t->inner;
+      return (Type *)nullptr;
+    };
+    bool ok = true;
+    for (size_t i = 0; i < info.params.size(); i++) {
+      Type *t = info.params[i];
+      SourceLoc l = fd.params[i].loc;
+      if (!scalar(t)) {
+        error(l, "C functions can't take '" + t->str() + "'; use numbers, bool or pointers (*T)" +
+                     (t->kind == TypeKind::String ? " (a string can be passed to a '*byte' parameter)" : "") +
+                     (t->kind == TypeKind::Slice ? " (a slice can be passed to a '*" + t->inner->str() + "' parameter)" : ""));
+        ok = false;
+      } else if (Type *bad = pointee(t)) {
+        error(l, "C can't use '" + bad->str() + "' through a pointer; point to numbers, bool, pointers, "
+                 "structs of those, or void");
+        ok = false;
+      }
+    }
+    if (info.ret->kind != TypeKind::Void && !scalar(info.ret)) {
+      error(fd.ret->loc, "C functions can't return '" + info.ret->str() + "'; use numbers, bool or pointers (*T)");
+      ok = false;
+    }
+    return ok;
   }
 
   // ----- scopes -----
@@ -653,8 +746,8 @@ private:
         break;
       }
       checkMutablePlace(st.target.get(), "modify");
-      if (t->kind != TypeKind::Int)
-        error(st.loc, "'++' and '--' need an int, found '" + t->str() + "'");
+      if (!t->isInteger())
+        error(st.loc, "'++' and '--' need an integer, found '" + t->str() + "'");
       break;
     }
     case StmtKind::If: {
@@ -904,7 +997,7 @@ private:
 
     sw.mode = SwitchStmt::Values;
     bool isStr = base->kind == TypeKind::String;
-    if (!isStr && !(tt->kind == TypeKind::Int || tt->kind == TypeKind::Float || tt->kind == TypeKind::Bool)) {
+    if (!isStr && !(tt->isNumeric() || tt->kind == TypeKind::Bool)) {
       error(sw.tag->loc, "cannot switch on a value of type '" + tt->str() + "'");
       return;
     }
@@ -991,8 +1084,8 @@ private:
       error(as.loc, "compound assignment needs an int or float, found '" + lt->str() + "'");
       return;
     }
-    if (as.op == AssignOp::Rem && lt->kind != TypeKind::Int) {
-      error(as.loc, "'%=' needs an int");
+    if (as.op == AssignOp::Rem && !lt->isInteger()) {
+      error(as.loc, "'%=' needs an integer");
       return;
     }
     coerce(as.rhs, lt);
@@ -1111,6 +1204,15 @@ private:
                         "' to allow that");
       return false;
     }
+    if (t != target && target->isNumeric() && isNumericLiteral(e.get()))
+      return retypeLiteral(e, target);
+    if (t->kind == TypeKind::Nil && target->isPtr()) {
+      e->type = target;
+      return true;
+    }
+    // Like C, *void converts to and from any pointer.
+    if (t->isPtr() && target->isPtr() && (t->inner->kind == TypeKind::Void || target->inner->kind == TypeKind::Void))
+      return true;
     if (t == target) {
       // Passing a `&mut` place reborrows instead of moving the reference.
       if (t->isMutRef() && isPlace(e.get()))
@@ -1124,6 +1226,10 @@ private:
     std::string hint;
     if (t->kind == TypeKind::None)
       hint = " ('none' can only be used where an optional '?T' is expected)";
+    else if (t->kind == TypeKind::Nil)
+      hint = " ('nil' can only be used for C pointers '*T')";
+    else if (t->isNumeric() && target->isNumeric())
+      hint = " (convert it with " + target->str() + "(x))";
     else if (t->isOptional() && t->en->optionalOf == target)
       hint = " (the value may be missing: use 'x or default', or a switch with 'case some(v)')";
     else if (t->isResult() && t->en->resultOf == target)
@@ -1136,6 +1242,48 @@ private:
       hint = " (a shared reference cannot be turned into a mutable one)";
     error(e->loc, "mismatched types: expected '" + target->str() + "', found '" + t->str() + "'" + hint);
     return false;
+  }
+
+  // Gives a numeric literal (see isNumericLiteral) the type `target`.
+  bool retypeLiteral(ExprPtr &e, Type *target, bool negated = false) {
+    if (e->kind == ExprKind::Unary) {
+      auto *u = static_cast<UnaryExpr *>(e.get());
+      if (target->kind == TypeKind::IntN && target->isUnsigned) {
+        error(e->loc, "negative constant overflows '" + target->str() + "'");
+        return false;
+      }
+      if (!retypeLiteral(u->operand, target, !negated))
+        return false;
+      e->type = target;
+      return true;
+    }
+    if (e->kind == ExprKind::FloatLit) {
+      if (!target->isFloat()) {
+        error(e->loc, "mismatched types: expected '" + target->str() + "', found 'float' (convert it with " +
+                          target->str() + "(x))");
+        return false;
+      }
+      e->type = target;
+      return true;
+    }
+    int64_t v = static_cast<IntLitExpr *>(e.get())->value;
+    if (target->isFloat()) {
+      e = std::make_unique<FloatLitExpr>(e->loc, (double)v);
+      e->type = target;
+      return true;
+    }
+    if (target->kind == TypeKind::IntN && target->bits < 64) {
+      // Signed types reach one further below zero: int8 holds -128 but not 128.
+      int64_t max = target->isUnsigned ? (int64_t(1) << target->bits) - 1
+                                       : (int64_t(1) << (target->bits - 1)) - (negated ? 0 : 1);
+      if (v > max) {
+        error(e->loc, "constant " + std::string(negated ? "-" : "") + std::to_string(v) + " overflows '" +
+                          target->str() + "'");
+        return false;
+      }
+    }
+    e->type = target;
+    return true;
   }
 
   Type *check(ExprPtr &e) {
@@ -1151,6 +1299,7 @@ private:
     case ExprKind::StrLit: return tc_.stringTy();
     case ExprKind::BoolLit: return tc_.boolTy();
     case ExprKind::NoneLit: return tc_.noneTy();
+    case ExprKind::NilLit: return tc_.nilTy();
     case ExprKind::EnumLit: return e->type;
     case ExprKind::Ident: {
       auto *id = static_cast<IdentExpr *>(e.get());
@@ -1324,6 +1473,10 @@ private:
       }
       return t;
     case UnOp::Deref:
+      if (t->isPtr()) {
+        error(u.loc, "C pointers can't be dereferenced in co; pass them to C functions (and use cstr(p) for C strings)");
+        return nullptr;
+      }
       if (!t->isRef()) {
         error(u.loc, "cannot dereference '" + t->str() + "' (it is not a reference)");
         return nullptr;
@@ -1435,6 +1588,23 @@ private:
       b.noneCheck = true; // compares variants only
       return tc_.boolTy();
     }
+    // A literal on one side takes the other side's numeric type; nil takes a pointer type.
+    if (lt != rt) {
+      bool litL = isNumericLiteral(b.lhs.get()), litR = isNumericLiteral(b.rhs.get());
+      if (litL && litR) { // `1 + 2.5`: the int literal becomes a float
+        litL = lt->isInteger();
+        litR = !litL;
+      }
+      if ((rt->kind == TypeKind::Nil && lt->isPtr()) || (lt->isNumeric() && litR)) {
+        if (!coerce(b.rhs, lt))
+          return nullptr;
+        rt = lt;
+      } else if ((lt->kind == TypeKind::Nil && rt->isPtr()) || (rt->isNumeric() && litL)) {
+        if (!coerce(b.lhs, rt))
+          return nullptr;
+        lt = rt;
+      }
+    }
     switch (b.op) {
     case BinOp::OrElse:
       return nullptr;
@@ -1463,8 +1633,8 @@ private:
         error(b.loc, "arithmetic needs int or float operands, found '" + lt->str() + "'");
         return nullptr;
       }
-      if (b.op == BinOp::Rem && lt->kind != TypeKind::Int) {
-        error(b.loc, "'%' needs int operands");
+      if (b.op == BinOp::Rem && !lt->isInteger()) {
+        error(b.loc, "'%' needs integer operands");
         return nullptr;
       }
       return lt;
@@ -1482,7 +1652,7 @@ private:
       if (lt != rt)
         return mismatch();
       bool ordered = b.op != BinOp::Eq && b.op != BinOp::Ne;
-      if (!(lt->isNumeric() || (!ordered && lt->kind == TypeKind::Bool))) {
+      if (!(lt->isNumeric() || (!ordered && (lt->kind == TypeKind::Bool || lt->isPtr())))) {
         error(b.loc, "cannot compare values of type '" + lt->str() + "'");
         return nullptr;
       }
@@ -1708,6 +1878,8 @@ private:
   // Checks c.args[first..] against c.func->params[first..].
   void checkArgs(CallExpr &c, size_t first) {
     FuncInfo *f = c.func;
+    if (f->isExtern)
+      return checkExternArgs(c);
     size_t expected = f->params.size() - first;
     size_t given = c.args.size() - first;
     for (size_t i = first; i < c.args.size(); i++) {
@@ -1722,6 +1894,74 @@ private:
     for (size_t i = first; i < c.args.size(); i++)
       if (c.args[i]->type)
         coerce(c.args[i], f->params[i], true);
+  }
+
+  // Calls to C. Besides values of the parameter types, a pointer parameter
+  // accepts (for the duration of the call):
+  //   string  -> *byte / *int8 / *void: a NUL-terminated copy
+  //   []T     -> *T: the slice's elements (pass &mut s to let C write them)
+  //   &x      -> *T: the address of x (also &mut x)
+  void checkExternArgs(CallExpr &c) {
+    FuncInfo *f = c.func;
+    for (auto &a : c.args)
+      if (!a->type)
+        check(a);
+    size_t n = f->params.size();
+    if (c.args.size() < n || (!f->variadic && c.args.size() != n)) {
+      error(c.loc, "'" + f->name + "' expects " + (f->variadic ? "at least " : "") + std::to_string(n) +
+                       " argument" + (n == 1 ? "" : "s") + ", but " + std::to_string(c.args.size()) + " were given");
+      return;
+    }
+    for (size_t i = 0; i < c.args.size(); i++) {
+      ExprPtr &a = c.args[i];
+      if (!a->type)
+        continue;
+      if (i < n)
+        externArg(a, f->params[i]);
+      else
+        variadicArg(a);
+    }
+  }
+
+  void externArg(ExprPtr &a, Type *p) {
+    Type *t = a->type;
+    if (!p->isPtr() || t->isPtr() || t->kind == TypeKind::Nil) {
+      coerce(a, p, true);
+      return;
+    }
+    Type *pe = p->inner;
+    Type *base = t->derefAll();
+    if (base->kind == TypeKind::String && ((pe->kind == TypeKind::IntN && pe->bits == 8) || pe->kind == TypeKind::Void)) {
+      autoRefShared(a);
+      return;
+    }
+    if (base->kind == TypeKind::Slice && (base->inner == pe || pe->kind == TypeKind::Void)) {
+      if (!t->isRef())
+        autoRefShared(a);
+      return;
+    }
+    if (t->isRef() && (t->inner == pe || pe->kind == TypeKind::Void) && (pe->kind == TypeKind::Void || pe->isCCompatible()))
+      return;
+    std::string hint;
+    if (!t->isRef() && (t == pe || pe->kind == TypeKind::Void))
+      hint = " (pass '&" + exprStr(a.get()) + "' to give C its address)";
+    error(a->loc, "cannot pass '" + t->str() + "' to C as '" + p->str() + "'" + hint);
+  }
+
+  // Arguments after `...` follow C's rules: small integers widen to int,
+  // float32 to double; strings become C strings.
+  void variadicArg(ExprPtr &a) {
+    Type *t = a->type;
+    if (t->derefAll()->kind == TypeKind::String) {
+      autoRefShared(a);
+      return;
+    }
+    if (t->kind == TypeKind::Nil) {
+      a->type = tc_.ptr(tc_.voidTy());
+      return;
+    }
+    if (!t->isNumeric() && t->kind != TypeKind::Bool && !t->isPtr())
+      error(a->loc, "cannot pass '" + t->str() + "' to a variadic C function; use numbers, bool, pointers or strings");
   }
 
   Type *checkMethodCall(CallExpr &c) {
@@ -1852,16 +2092,30 @@ private:
       autoRefShared(c.args[0]);
       return t;
     }
-    case Builtin::ToInt:
-    case Builtin::ToFloat: {
-      const char *n = c.builtin == Builtin::ToInt ? "int" : "float";
-      if (!argCount(c, n, 1))
+    case Builtin::Convert: {
+      std::string n = static_cast<IdentExpr *>(c.callee.get())->name;
+      Type *target = tc_.numericByName(n);
+      if (!argCount(c, n.c_str(), 1))
         return nullptr;
+      // A literal that can have the target type just takes it (int8(-5));
+      // others are converted like any value (int(2.5)).
+      if (isNumericLiteral(c.args[0].get()) && (c.args[0]->type->isInteger() || target->isFloat()))
+        return coerce(c.args[0], target) ? target : nullptr;
       if (!c.args[0]->type->isNumeric()) {
-        error(c.args[0]->loc, std::string("cannot convert '") + c.args[0]->type->str() + "' to " + n);
+        error(c.args[0]->loc, "cannot convert '" + c.args[0]->type->str() + "' to " + n);
         return nullptr;
       }
-      return c.builtin == Builtin::ToInt ? tc_.intTy() : tc_.floatTy();
+      return target;
+    }
+    case Builtin::CStr: {
+      if (!argCount(c, "cstr", 1))
+        return nullptr;
+      Type *t = c.args[0]->type;
+      if (!t->isPtr() || t->inner->kind != TypeKind::IntN || t->inner->bits != 8) {
+        error(c.args[0]->loc, "cstr() copies a C string ('*byte' or '*int8'), found '" + t->str() + "'");
+        return nullptr;
+      }
+      return tc_.stringTy();
     }
     case Builtin::ToStr: {
       if (!argCount(c, "str", 1))
@@ -1875,8 +2129,8 @@ private:
         error(c.args[0]->loc, "str() needs a value; use '*x'");
         return nullptr;
       }
-      if (k != TypeKind::Int && k != TypeKind::Float && k != TypeKind::Bool) {
-        error(c.args[0]->loc, "str() converts int, float, bool or error, found '" + c.args[0]->type->str() + "'");
+      if (!c.args[0]->type->isNumeric() && k != TypeKind::Bool) {
+        error(c.args[0]->loc, "str() converts numbers, bool or error, found '" + c.args[0]->type->str() + "'");
         return nullptr;
       }
       return tc_.stringTy();

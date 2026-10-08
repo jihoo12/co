@@ -1,0 +1,6 @@
+// error: invalid library name "no spaces"
+extern "no spaces" {
+    func nothing()
+}
+
+func main() {}

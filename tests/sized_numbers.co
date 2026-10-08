@@ -1,0 +1,50 @@
+// Sized integers and float32: wrapping, unsigned arithmetic, conversions, literals.
+// expect: 127 -128 255 0
+// expect: 4294967295 2147483647
+// expect: true false
+// expect: 3 1
+// expect: 2.5 0.1
+// expect: 2147483647 0 -3
+// expect: 1.5 3 255
+// expect: 200 int8=-56
+// expect: 18446744073709551615
+type Pixel struct {
+    r, g, b uint8
+}
+
+func brighten(p &mut Pixel, by uint8) {
+    p.r += by
+    p.g += by
+}
+
+func main() {
+    var a int8 = 127
+    b := a + 1                     // wraps
+    var c uint8 = 255
+    d := c + 1
+    println(a, b, c, d)
+
+    var big uint32 = 4294967295
+    println(big, int32(big / 2))
+
+    var x uint32 = 1
+    println(big > x, int32(big) > int32(x))   // unsigned vs signed comparison
+
+    var n int16 = 7
+    println(n / 2, n % 3)
+
+    var f float32 = 2.5
+    var tenth float32 = 0.1
+    println(f, tenth)
+
+    println(int32(1e20), uint8(-5.0), int(-3.9))   // conversions saturate / truncate
+
+    var half float = 3 / 2.0
+    p := Pixel{r: 250, g: 1, b: 255}
+    brighten(&mut p, 2)
+    println(half, p.g, p.b)
+
+    var u uint8 = 200
+    println(str(u), "int8=" + str(int8(u)))
+    println(uint64(0) - 1)
+}

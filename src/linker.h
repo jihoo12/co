@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 namespace co {
 
@@ -16,7 +17,15 @@ struct LinkPlan {
 
 LinkPlan planLink();
 
+// C libraries to link with: `libs` (from `extern "lib"` blocks, as for -l),
+// searched for in `dirs` first. Programs also find them there at run time.
+struct LinkLibs {
+  std::vector<std::string> libs;
+  std::vector<std::string> dirs;
+};
+
 // Links object file `obj` into executable `out`.
-bool link(const LinkPlan &plan, const std::string &obj, const std::string &out, std::string &error);
+bool link(const LinkPlan &plan, const std::string &obj, const std::string &out, const LinkLibs &libs,
+          std::string &error);
 
 } // namespace co

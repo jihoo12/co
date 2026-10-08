@@ -13,7 +13,7 @@ namespace co {
 // ----- Type syntax -----
 
 struct TypeExpr {
-  enum Kind { Name, Ref, Slice, Optional, Result, Map } kind = Name; // Result: `!T`, or `!` (inner null)
+  enum Kind { Name, Ref, Slice, Optional, Result, Map, Ptr } kind = Name; // Result: `!T`, or `!` (inner null)
   std::string name;  // Name
   std::string pkg;   // Name: the import name in `pkg.Name`, if qualified
   bool mut = false;  // Ref
@@ -33,7 +33,7 @@ struct LocalVar {
 // ----- Expressions -----
 
 enum class ExprKind {
-  IntLit, FloatLit, StrLit, BoolLit, NoneLit, Ident, Unary, Binary, Call, Field, Index, StructLit, SliceLit, EnumLit,
+  IntLit, FloatLit, StrLit, BoolLit, NoneLit, NilLit, Ident, Unary, Binary, Call, Field, Index, StructLit, SliceLit, EnumLit,
   MapLit
 };
 
@@ -52,7 +52,8 @@ enum class UnOp {
 // OrElse is `opt or default`.
 enum class BinOp { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, Gt, Ge, And, Or, OrElse };
 
-enum class Builtin { None, Print, Println, Len, Append, Clone, ToInt, ToFloat, ToStr, Panic, MakeError, Delete };
+// Convert: a numeric conversion like int32(x); the target is the call's type.
+enum class Builtin { None, Print, Println, Len, Append, Clone, Convert, ToStr, Panic, MakeError, Delete, CStr };
 
 struct Expr {
   ExprKind kind;
@@ -78,6 +79,9 @@ struct StrLitExpr : Expr {
 struct BoolLitExpr : Expr {
   bool value;
   BoolLitExpr(SourceLoc l, bool v) : Expr(ExprKind::BoolLit, l), value(v) {}
+};
+struct NilLitExpr : Expr {
+  explicit NilLitExpr(SourceLoc l) : Expr(ExprKind::NilLit, l) {}
 };
 struct NoneLitExpr : Expr {
   explicit NoneLitExpr(SourceLoc l) : Expr(ExprKind::NoneLit, l) {}
@@ -270,7 +274,9 @@ struct FuncDecl {
   std::optional<Param> receiver;
   std::vector<Param> params;
   TypeExprPtr ret; // optional
-  std::unique_ptr<BlockStmt> body;
+  std::unique_ptr<BlockStmt> body; // null for extern functions
+  bool isExtern = false;           // declared in an `extern` block: a C function
+  bool variadic = false;           // extern only: `...` after the parameters
   FuncInfo *info = nullptr;
   std::vector<std::unique_ptr<LocalVar>> locals; // owned storage for all LocalVars
 };
@@ -311,6 +317,8 @@ struct FuncInfo {
   Type *ret = nullptr;
   StructInfo *recvStruct = nullptr;
   FuncDecl *decl = nullptr;
+  bool isExtern = false; // a C function; `symbol` is its C name
+  bool variadic = false;
 };
 
 // ----- Packages -----
@@ -353,6 +361,7 @@ struct Program {
   std::vector<std::unique_ptr<StructDecl>> structs;
   std::vector<std::unique_ptr<EnumDecl>> enums;
   std::vector<std::unique_ptr<FuncDecl>> funcs;
+  std::vector<std::string> libs; // C libraries named by `extern "lib"` blocks, to link with
   // Filled by sema:
   std::vector<std::unique_ptr<StructInfo>> structInfos;
   std::vector<std::unique_ptr<EnumInfo>> enumInfos;

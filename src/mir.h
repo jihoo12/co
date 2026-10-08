@@ -57,14 +57,14 @@ enum class BuiltinOp {
   Append,    // append([]T, T) -> []T
   Push,      // push(&mut []T, T)  (in-place append)
   Clone,     // clone(&T) -> T
-  ToInt,
-  ToFloat,
+  Convert,   // numeric conversion to `type`
   ToStr,
   Panic,     // panic(&string)
   StrLit,    // creates an owned string from `strLit`
   StrConcat, // (&string, &string) -> string
   StrCmp,    // (&string, &string) -> bool using `cmp`
   MakeError, // error(&string) -> error
+  CStr,      // cstr(*byte) -> string, copying a NUL-terminated C string
   // Maps. Keys are always passed by reference.
   MapGet,    // (&map, &K) -> ?V or ?&V
   MapSlot,   // (&mut map, &K) -> &mut V, inserting a zero value if missing

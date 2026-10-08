@@ -95,7 +95,11 @@ func add(a, b int) int { return a + b }
 ```
 
 Types: `int` (64-bit), `float` (64-bit), `bool`, `string`, slices `[]T`, maps `map[K]V`, structs, enums,
-optionals `?T`, results `!T`, `error`, and references `&T` / `&mut T`.
+optionals `?T`, results `!T`, `error`, and references `&T` / `&mut T`. For data with a fixed layout (and
+for C) there are also `int8` `int16` `int32` `uint8` (`byte`) `uint16` `uint32` `uint64` and `float32`;
+they wrap around on overflow. Number literals take whatever numeric type is needed (`var b byte = 200`,
+`x * 2.5`), and other conversions are explicit: `int32(n)`, `float(i)`, `uint8(x)` (float to integer
+conversions saturate).
 
 Builtins: `println(...)`, `print(...)`, `len(x)`, `append(v, x)`, `clone(x)`, `str(x)`, `int(x)`,
 `float(x)`, `error(msg)`, `delete(m, k)`, `panic(msg)`. `println` can print anything, including structs, slices, enums and optionals.
@@ -297,6 +301,44 @@ cycles are an error. `coc run main.co` compiles just that file as the main packa
 `coc run .` compiles every `.co` file in the directory. Variants of an exported enum can be written
 `geom.Circle(2)` or `geom.Shape.Circle(2)`, and the same goes for `case` patterns.
 
+## Calling C
+
+Declare C functions in an `extern` block, naming the library they come from (linked as `-lname`; leave
+the name out for the C library itself). Parameters and results are numbers, `bool` and C pointers `*T`:
+
+```go
+extern "sqlite3" {
+    func sqlite3_libversion() *byte
+    func sqlite3_open(name *byte, db **void) int32
+    func sqlite3_close(db *void) int32
+}
+
+extern {
+    func printf(format *byte, ...) int32      // variadic
+    func memset(p *void, c int32, n uint64) *void
+    func getenv(name *byte) *byte
+}
+
+func main() {
+    println(cstr(sqlite3_libversion()))      // cstr copies a C string into a co string
+    var db *void
+    sqlite3_open(":memory:", &mut db)        // &mut db is a **void out-parameter
+    sqlite3_close(db)
+
+    buf := []byte{0, 0, 0}
+    memset(&mut buf, 65, 3)                  // a slice passes its elements
+    printf("%s %d\n", "hi", int32(42))       // a string becomes a NUL-terminated copy
+    if getenv("NOPE") == nil { println("unset") }
+}
+```
+
+At a call to C, a `string` passed as `*byte` (or `*void`) becomes a temporary NUL-terminated copy, a
+slice passes a pointer to its elements, and `&x` / `&mut x` pass x's address; these are only valid during
+the call. C pointers can be `nil`, compared and stored, but not dereferenced in co. `*void` converts to and
+from any pointer, like in C. Use `coc build -L <dir>` for libraries outside the usual system directories
+(programs will look there at run time too). Not yet supported: C structs passed by value, and callbacks
+from C into co.
+
 ---
 
 # Ownership in 5 rules
@@ -419,5 +461,5 @@ any access that conflicts with one.
 
 ## Not yet supported
 
-Generics, interfaces, closures, a standard library of packages, string functions (split, indexing, ...), references
+Generics, interfaces, closures, bitwise operators, a standard library of packages, string functions (split, indexing, ...), references
 inside structs.

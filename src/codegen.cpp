@@ -120,6 +120,10 @@ private:
     case TypeKind::Void: return void_;
     case TypeKind::Int: return i64_;
     case TypeKind::Float: return f64_;
+    case TypeKind::IntN: return llvm::IntegerType::get(ctx_, t->bits);
+    case TypeKind::Float32: return llvm::Type::getFloatTy(ctx_);
+    case TypeKind::Ptr:
+    case TypeKind::Nil: return ptrTy_;
     case TypeKind::Bool: return i1_;
     case TypeKind::String:
     case TypeKind::Error:
@@ -362,11 +366,12 @@ private:
       ib.CreateCall(rt("co_print_cstr", void_, {ptrTy_}), {ib.CreateGlobalString(s)});
     };
     switch (t->kind) {
-    case TypeKind::Int: ib.CreateCall(rt("co_print_int", void_, {i64_}), {ib.CreateLoad(i64_, p)}); break;
-    case TypeKind::Float: ib.CreateCall(rt("co_print_float", void_, {f64_}), {ib.CreateLoad(f64_, p)}); break;
+    case TypeKind::Int:
+    case TypeKind::Float:
     case TypeKind::Bool:
-      ib.CreateCall(rt("co_print_bool", void_, {i32_}), {ib.CreateZExt(ib.CreateLoad(i1_, p), i32_)});
-      break;
+    case TypeKind::IntN:
+    case TypeKind::Float32:
+    case TypeKind::Ptr: printScalar(ib, t, ib.CreateLoad(lt(t), p)); break;
     case TypeKind::String:
     case TypeKind::Error: ib.CreateCall(rt("co_print_str", void_, {ptrTy_}), {p}); break;
     case TypeKind::Ref: ib.CreateCall(printFn(t->inner), {ib.CreateLoad(ptrTy_, p)}); break;
@@ -596,8 +601,8 @@ private:
     switch (o.kind) {
     case Operand::Const:
       switch (o.c.kind) {
-      case Constant::Int: return llvm::ConstantInt::get(i64_, o.c.i, true);
-      case Constant::Float: return llvm::ConstantFP::get(f64_, o.c.f);
+      case Constant::Int: return llvm::ConstantInt::get(lt(o.type), o.c.i, true);
+      case Constant::Float: return llvm::ConstantFP::get(lt(o.type), o.c.f);
       case Constant::Bool: return llvm::ConstantInt::get(i1_, o.c.b);
       case Constant::Zero: return llvm::Constant::getNullValue(lt(o.type));
       }
@@ -618,7 +623,8 @@ private:
     return nullptr;
   }
 
-  llvm::Value *binary(BinOp op, bool isFloat, llvm::Value *l, llvm::Value *r) {
+  // Arithmetic and comparisons; integers are signed unless `isSigned` is false.
+  llvm::Value *binary(BinOp op, bool isFloat, bool isSigned, llvm::Value *l, llvm::Value *r) {
     if (isFloat) {
       switch (op) {
       case BinOp::Add: return b_.CreateFAdd(l, r);
@@ -640,18 +646,21 @@ private:
     case BinOp::Mul: return b_.CreateMul(l, r);
     case BinOp::Div:
     case BinOp::Rem: {
-      panicIf(b_.CreateICmpEQ(r, llvm::ConstantInt::get(i64_, 0)), "integer division by zero");
-      auto *minInt = llvm::ConstantInt::get(i64_, INT64_MIN, true);
-      auto *minus1 = llvm::ConstantInt::get(i64_, -1, true);
+      auto *ty = llvm::cast<llvm::IntegerType>(l->getType());
+      panicIf(b_.CreateICmpEQ(r, llvm::ConstantInt::get(ty, 0)), "integer division by zero");
+      if (!isSigned)
+        return op == BinOp::Div ? b_.CreateUDiv(l, r) : b_.CreateURem(l, r);
+      auto *minInt = llvm::ConstantInt::get(ty, llvm::APInt::getSignedMinValue(ty->getBitWidth()));
+      auto *minus1 = llvm::ConstantInt::get(ty, -1, true);
       panicIf(b_.CreateAnd(b_.CreateICmpEQ(l, minInt), b_.CreateICmpEQ(r, minus1)), "integer overflow in division");
       return op == BinOp::Div ? b_.CreateSDiv(l, r) : b_.CreateSRem(l, r);
     }
     case BinOp::Eq: return b_.CreateICmpEQ(l, r);
     case BinOp::Ne: return b_.CreateICmpNE(l, r);
-    case BinOp::Lt: return b_.CreateICmpSLT(l, r);
-    case BinOp::Le: return b_.CreateICmpSLE(l, r);
-    case BinOp::Gt: return b_.CreateICmpSGT(l, r);
-    case BinOp::Ge: return b_.CreateICmpSGE(l, r);
+    case BinOp::Lt: return isSigned ? b_.CreateICmpSLT(l, r) : b_.CreateICmpULT(l, r);
+    case BinOp::Le: return isSigned ? b_.CreateICmpSLE(l, r) : b_.CreateICmpULE(l, r);
+    case BinOp::Gt: return isSigned ? b_.CreateICmpSGT(l, r) : b_.CreateICmpUGT(l, r);
+    case BinOp::Ge: return isSigned ? b_.CreateICmpSGE(l, r) : b_.CreateICmpUGE(l, r);
     default: return nullptr;
     }
   }
@@ -670,12 +679,99 @@ private:
       b_.CreateCall(printFn(t->inner), {v});
       return;
     }
+    if (t->isNumeric() || t->kind == TypeKind::Bool || t->isPtr())
+      printScalar(b_, t, v);
+  }
+
+  // Prints a number, bool or pointer.
+  void printScalar(llvm::IRBuilder<> &ib, Type *t, llvm::Value *v) {
     switch (t->kind) {
-    case TypeKind::Int: b_.CreateCall(rt("co_print_int", void_, {i64_}), {v}); break;
-    case TypeKind::Float: b_.CreateCall(rt("co_print_float", void_, {f64_}), {v}); break;
-    case TypeKind::Bool: b_.CreateCall(rt("co_print_bool", void_, {i32_}), {b_.CreateZExt(v, i32_)}); break;
+    case TypeKind::Int: ib.CreateCall(rt("co_print_int", void_, {i64_}), {v}); break;
+    case TypeKind::IntN:
+      if (t->isUnsigned)
+        ib.CreateCall(rt("co_print_uint", void_, {i64_}), {ib.CreateZExt(v, i64_)});
+      else
+        ib.CreateCall(rt("co_print_int", void_, {i64_}), {ib.CreateSExt(v, i64_)});
+      break;
+    case TypeKind::Float: ib.CreateCall(rt("co_print_float", void_, {f64_}), {v}); break;
+    case TypeKind::Float32: ib.CreateCall(rt("co_print_float", void_, {f64_}), {ib.CreateFPExt(v, f64_)}); break;
+    case TypeKind::Bool: ib.CreateCall(rt("co_print_bool", void_, {i32_}), {ib.CreateZExt(v, i32_)}); break;
+    case TypeKind::Ptr: ib.CreateCall(rt("co_print_ptr", void_, {ptrTy_}), {v}); break;
     default: break;
     }
+  }
+
+  // Numeric conversion, as in int32(x). Float-to-integer saturates (NaN gives 0).
+  llvm::Value *convert(llvm::Value *v, Type *from, Type *to) {
+    llvm::Type *dt = lt(to);
+    if (from == to)
+      return v;
+    if (from->isInteger() && to->isInteger())
+      return b_.CreateIntCast(v, dt, from->isSigned());
+    if (from->isInteger())
+      return from->isSigned() ? b_.CreateSIToFP(v, dt) : b_.CreateUIToFP(v, dt);
+    if (to->isInteger())
+      return b_.CreateIntrinsic(to->isSigned() ? llvm::Intrinsic::fptosi_sat : llvm::Intrinsic::fptoui_sat,
+                                {dt, v->getType()}, {v});
+    return b_.CreateFPCast(v, dt);
+  }
+
+  // ----- calling C -----
+
+  // Declares C function `f`. Integers narrower than int are extended by the
+  // caller, as C compilers expect.
+  llvm::FunctionCallee externFn(FuncInfo *f) {
+    std::vector<llvm::Type *> params;
+    for (Type *p : f->params)
+      params.push_back(lt(p));
+    auto *fty = llvm::FunctionType::get(f->ret->kind == TypeKind::Void ? void_ : lt(f->ret), params, f->variadic);
+    auto callee = mod_.getOrInsertFunction(f->symbol, fty);
+    auto ext = [](Type *t) {
+      if (t->kind == TypeKind::Bool || (t->kind == TypeKind::IntN && t->bits < 32))
+        return t->isSigned() ? llvm::Attribute::SExt : llvm::Attribute::ZExt;
+      return llvm::Attribute::None;
+    };
+    if (auto *fn = llvm::dyn_cast<llvm::Function>(callee.getCallee()); fn && fn->getFunctionType() == fty) {
+      for (size_t i = 0; i < f->params.size(); i++)
+        if (auto a = ext(f->params[i]); a != llvm::Attribute::None)
+          fn->addParamAttr((unsigned)i, a);
+      if (auto a = ext(f->ret); a != llvm::Attribute::None)
+        fn->addRetAttr(a);
+    }
+    return callee;
+  }
+
+  // A call to C. Strings become NUL-terminated copies (in a stack buffer when
+  // they fit) and slices their element pointers, both only for the call;
+  // variadic arguments get C's default promotions.
+  llvm::Value *externCall(const Rvalue &rv) {
+    FuncInfo *f = rv.func;
+    llvm::FunctionCallee callee = externFn(f);
+    std::vector<llvm::Value *> args;
+    std::vector<std::pair<llvm::Value *, llvm::Value *>> cstrs; // (C string, stack buffer)
+    const int64_t bufSize = 256;
+    for (size_t i = 0; i < rv.ops.size(); i++) {
+      Type *t = rv.ops[i].type;
+      llvm::Value *v = operand(rv.ops[i]);
+      if (t->isRef() && t->inner->kind == TypeKind::String) {
+        llvm::Value *buf = entryAlloca(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx_), bufSize), "cstr.buf");
+        v = b_.CreateCall(rt("co_cstr_begin", ptrTy_, {ptrTy_, ptrTy_, i64_}),
+                          {v, buf, llvm::ConstantInt::get(i64_, bufSize)});
+        cstrs.push_back({v, buf});
+      } else if (t->isRef() && t->inner->kind == TypeKind::Slice) {
+        v = b_.CreateLoad(ptrTy_, b_.CreateStructGEP(vecTy_, v, 0));
+      } else if (i >= f->params.size()) {
+        if (t->kind == TypeKind::Float32)
+          v = b_.CreateFPExt(v, f64_);
+        else if (t->kind == TypeKind::Bool || (t->kind == TypeKind::IntN && t->bits < 32))
+          v = b_.CreateIntCast(v, i32_, t->isSigned());
+      }
+      args.push_back(v);
+    }
+    llvm::Value *res = b_.CreateCall(callee, args);
+    for (auto &[p, buf] : cstrs)
+      b_.CreateCall(rt("co_cstr_end", void_, {ptrTy_, ptrTy_}), {p, buf});
+    return f->ret->kind == TypeKind::Void ? nullptr : res;
   }
 
   llvm::Value *rvalue(const Rvalue &rv) {
@@ -685,13 +781,14 @@ private:
     case Rvalue::BinaryOp: {
       llvm::Value *l = operand(rv.ops[0]);
       llvm::Value *r = operand(rv.ops[1]);
-      return binary(rv.bop, rv.ops[0].type->kind == TypeKind::Float, l, r);
+      Type *t = rv.ops[0].type;
+      return binary(rv.bop, t->isFloat(), !t->isInteger() || t->isSigned(), l, r);
     }
     case Rvalue::UnaryOp: {
       llvm::Value *v = operand(rv.ops[0]);
       if (rv.uop == UnOp::Not)
         return b_.CreateNot(v);
-      return rv.type->kind == TypeKind::Float ? b_.CreateFNeg(v) : b_.CreateNeg(v);
+      return rv.type->isFloat() ? b_.CreateFNeg(v) : b_.CreateNeg(v);
     }
     case Rvalue::Ref: {
       Type *ty;
@@ -735,6 +832,8 @@ private:
       return b_.CreateLoad(vecTy_, vec);
     }
     case Rvalue::Call: {
+      if (rv.func->isExtern)
+        return externCall(rv);
       std::vector<llvm::Value *> args;
       for (auto &op : rv.ops)
         args.push_back(operand(op));
@@ -785,10 +884,10 @@ private:
       b_.CreateCall(cloneFn(t), {out, a[0]});
       return b_.CreateLoad(lt(t), out);
     }
-    case BuiltinOp::ToInt:
-      return rv.ops[0].type->kind == TypeKind::Float ? b_.CreateFPToSI(a[0], i64_) : a[0];
-    case BuiltinOp::ToFloat:
-      return rv.ops[0].type->kind == TypeKind::Int ? b_.CreateSIToFP(a[0], f64_) : a[0];
+    case BuiltinOp::Convert:
+      return convert(a[0], rv.ops[0].type, rv.type);
+    case BuiltinOp::CStr:
+      return viaOut("co_str_from_cstr", {ptrTy_}, {a[0]});
     case BuiltinOp::MakeError:
       return viaOut("co_str_clone", {ptrTy_}, {a[0]});
     case BuiltinOp::MapGet: {
@@ -850,7 +949,12 @@ private:
       switch (rv.ops[0].type->derefAll()->kind) {
       case TypeKind::Error: return viaOut("co_str_clone", {ptrTy_}, {a[0]});
       case TypeKind::Int: return viaOut("co_str_from_int", {i64_}, {a[0]});
+      case TypeKind::IntN:
+        if (rv.ops[0].type->isUnsigned)
+          return viaOut("co_str_from_uint", {i64_}, {b_.CreateZExt(a[0], i64_)});
+        return viaOut("co_str_from_int", {i64_}, {b_.CreateSExt(a[0], i64_)});
       case TypeKind::Float: return viaOut("co_str_from_float", {f64_}, {a[0]});
+      case TypeKind::Float32: return viaOut("co_str_from_float", {f64_}, {b_.CreateFPExt(a[0], f64_)});
       default: return viaOut("co_str_from_bool", {i32_}, {b_.CreateZExt(a[0], i32_)});
       }
     case BuiltinOp::Panic:
@@ -865,7 +969,7 @@ private:
     case BuiltinOp::StrCmp: {
       llvm::Value *c = b_.CreateCall(rt("co_str_cmp", i64_, {ptrTy_, ptrTy_}), {a[0], a[1]});
       llvm::Value *zero = llvm::ConstantInt::get(i64_, 0);
-      return binary(rv.cmp, false, c, zero);
+      return binary(rv.cmp, false, true, c, zero);
     }
     }
     return nullptr;
