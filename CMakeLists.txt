@@ -52,6 +52,7 @@ add_executable(coc
   src/mir_build.cpp
   src/borrowck.cpp
   src/codegen.cpp
+  src/linker.cpp
   ${CO_RUNTIME_CPP}
 )
 target_include_directories(coc PRIVATE src runtime ${LLVM_INCLUDE_DIRS})
@@ -65,9 +66,23 @@ endif()
 if(LLVM_LINK_LLVM_DYLIB)
   target_link_libraries(coc PRIVATE LLVM)
 else()
-  llvm_map_components_to_libnames(llvm_libs core support passes target targetparser mc native bitreader linker ipo)
+  llvm_map_components_to_libnames(llvm_libs core support passes target targetparser mc native ${LLVM_NATIVE_ARCH}AsmParser bitreader linker ipo)
   target_link_libraries(coc PRIVATE ${llvm_libs})
 endif()
+
+# With lld, coc links programs itself instead of running the system C compiler.
+find_package(LLD CONFIG HINTS $ENV{LLD_DIR} ${LLVM_DIR}/../lld)
+if(LLD_FOUND)
+  message(STATUS "Using lld from ${LLD_CMAKE_DIR}: built-in linker enabled")
+  target_include_directories(coc PRIVATE ${LLD_INCLUDE_DIRS})
+  target_compile_definitions(coc PRIVATE CO_HAVE_LLD=1)
+  target_link_libraries(coc PRIVATE lldELF lldCommon)
+else()
+  message(WARNING "lld not found (set LLD_DIR): coc will link programs with the system C compiler")
+endif()
+set(CO_DEFAULT_CC "cc" CACHE STRING "C compiler driver coc links with when it can't link by itself")
+target_compile_definitions(coc PRIVATE CO_DEFAULT_CC="${CO_DEFAULT_CC}")
+
 install(TARGETS coc RUNTIME DESTINATION bin)
 
 enable_testing()

@@ -3,6 +3,7 @@
 #include "codegen.h"
 #include "diag.h"
 #include "lexer.h"
+#include "linker.h"
 #include "mir_build.h"
 #include "parser.h"
 #include "sema.h"
@@ -136,6 +137,8 @@ int main(int argc, char **argv) {
   }
   if (emitLLVM)
     opts.llvmIrPath = output + ".ll";
+  LinkPlan plan = planLink();
+  opts.startAsm = plan.startAsm;
 
   llvm::SmallString<128> obj;
   if (llvm::sys::fs::createTemporaryFile("co", "o", obj)) {
@@ -149,26 +152,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Link with the system C compiler driver.
-  const char *ccEnv = getenv("CO_CC");
-  std::string ccName = ccEnv ? ccEnv : "cc";
-  auto cc = llvm::sys::findProgramByName(ccName);
-  if (!cc) {
-    fprintf(stderr, "coc: cannot find C compiler '%s' for linking (set CO_CC)\n", ccName.c_str());
-    llvm::sys::fs::remove(obj);
-    return 1;
-  }
-  // The object already contains the runtime; cc adds the C library and startup code.
-  std::vector<std::string> linkArgs = {std::string(obj), "-o", output, "-lm"};
-  if (const char *extra = getenv("CO_LDFLAGS")) {
-    std::istringstream flags(extra);
-    for (std::string f; flags >> f;)
-      linkArgs.push_back(f);
-  }
-  int rc = runProgram(*cc, linkArgs);
+  bool linked = link(plan, std::string(obj), output, err);
   llvm::sys::fs::remove(obj);
-  if (rc != 0) {
-    fprintf(stderr, "coc: linking failed\n");
+  if (!linked) {
+    fprintf(stderr, "coc: %s\n", err.c_str());
     return 1;
   }
 

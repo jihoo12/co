@@ -957,6 +957,7 @@ std::unique_ptr<llvm::Module> loadRuntime(llvm::LLVMContext &ctx, const llvm::Mo
 bool emitObject(const mir::Module &m, const std::string &objPath, const CodegenOptions &opts, std::string &error) {
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser(); // for the _start asm of LinkPlan
 
   llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
   const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, error);
@@ -995,6 +996,8 @@ bool emitObject(const mir::Module &m, const std::string &objPath, const CodegenO
     return false;
   }
   llvm::internalizeModule(mod, [](const llvm::GlobalValue &gv) { return gv.getName() == "main"; });
+  if (!opts.startAsm.empty())
+    mod.appendModuleInlineAsm(opts.startAsm);
 
   if (opts.optLevel > 0) {
     llvm::LoopAnalysisManager lam;

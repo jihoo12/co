@@ -8,6 +8,7 @@ namespace co {
 struct CodegenOptions {
   int optLevel = 2;
   std::string llvmIrPath; // if set, also write textual LLVM IR here
+  std::string startAsm;   // if set, module-level asm added to the program (see LinkPlan)
 };
 
 // Lowers MIR to LLVM IR and writes a native object file.

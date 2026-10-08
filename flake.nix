@@ -18,17 +18,18 @@
             pname = "co";
             version = "0.1.0";
             src = self;
-            nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.makeWrapper llvm.llvm ];
-            buildInputs = [ llvm.llvm ];
+            nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 llvm.llvm ];
+            buildInputs = [ llvm.llvm llvm.lld ];
+            cmakeFlags = [
+              "-DLLD_DIR=${llvm.lld.dev}/lib/cmake/lld"
+              # Only used where coc can't link by itself (e.g. macOS).
+              "-DCO_DEFAULT_CC=${llvm.stdenv.cc}/bin/cc"
+            ];
             doCheck = true;
             checkPhase = ''
               runHook preCheck
               ctest --output-on-failure
               runHook postCheck
-            '';
-            # coc links programs with a C compiler driver; default to the one we were built with.
-            postInstall = ''
-              wrapProgram $out/bin/coc --set-default CO_CC ${llvm.stdenv.cc}/bin/cc
             '';
           };
         });
@@ -53,6 +54,7 @@
             inputsFrom = [ self.packages.${system}.default ];
             packages = [ llvm.clang-tools llvm.lld llvm.lldb ];
             LLVM_DIR = "${llvm.llvm.dev}/lib/cmake/llvm";
+            LLD_DIR = "${llvm.lld.dev}/lib/cmake/lld";
           };
         });
     };
