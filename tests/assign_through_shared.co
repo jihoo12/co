@@ -1,0 +1,6 @@
+// error: cannot assign to 'p.x' because 'p' is a shared reference
+type P struct { x int }
+func f(p &P) {
+    p.x = 1
+}
+func main() {}

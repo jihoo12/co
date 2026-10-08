@@ -1,0 +1,11 @@
+// expect: 3.5 7 -2
+// expect: 0.333333
+// expect: 3
+func main() {
+    x := 1.5 + 2.0
+    y := int(x * 2.0)
+    z := -(y - 5)
+    println(x, y, z)
+    println(1.0 / 3.0)
+    println(int(float(10) / 3.0))
+}

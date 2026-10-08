@@ -1,0 +1,7 @@
+// exit: 101
+// stderr: index out of range [5] with length 2
+func main() {
+    v := []int{1, 2}
+    i := 5
+    println(v[i])
+}

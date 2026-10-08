@@ -1,0 +1,6 @@
+// error: cannot move out of 'v[..]' because it is an element of a slice
+func main() {
+    v := []string{"a"}
+    s := v[0]
+    println(s)
+}

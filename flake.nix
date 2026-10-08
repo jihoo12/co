@@ -15,10 +15,10 @@
           llvm = pkgs.llvmPackages_22;
         in {
           default = llvm.stdenv.mkDerivation {
-            pname = "faust";
+            pname = "co";
             version = "0.1.0";
             src = self;
-            nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 llvm.llvm ];
+            nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.makeWrapper llvm.llvm ];
             buildInputs = [ llvm.llvm ];
             doCheck = true;
             checkPhase = ''
@@ -26,8 +26,19 @@
               ctest --output-on-failure
               runHook postCheck
             '';
+            # coc links programs with a C compiler driver; default to the one we were built with.
+            postInstall = ''
+              wrapProgram $out/bin/coc --set-default CO_CC ${llvm.stdenv.cc}/bin/cc
+            '';
           };
         });
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/coc";
+        };
+      });
 
       checks = forAllSystems (system: {
         compiler = self.packages.${system}.default;

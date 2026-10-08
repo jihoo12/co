@@ -1,0 +1,10 @@
+// expect: 11 22
+type P struct { a, b int }
+func main() {
+    p := P{a: 1, b: 2}
+    x := &mut p.a
+    y := &mut p.b     // different fields: no conflict
+    *x += 10
+    *y += 20
+    println(p.a, p.b)
+}

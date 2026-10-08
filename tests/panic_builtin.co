@@ -1,0 +1,13 @@
+// exit: 101
+// expect: before
+// stderr: panic: boom 7
+func check(n int) int {
+    if n > 3 {
+        panic("boom " + str(n))
+    }
+    return n
+}
+func main() {
+    println("before")
+    check(7)
+}

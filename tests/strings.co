@@ -1,0 +1,18 @@
+// expect: hello world
+// expect: 11
+// expect: true false true
+// expect: abc!!
+// expect: n=42 f=2.5 b=true
+func main() {
+    a := "hello"
+    b := "world"
+    c := a + " " + b
+    println(c)
+    println(len(c))
+    println(a == "hello", a == b, a < b)
+    s := "abc"
+    s += "!"
+    s += "!"
+    println(s)
+    println("n=" + str(42) + " f=" + str(2.5) + " b=" + str(true))
+}

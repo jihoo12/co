@@ -1,0 +1,11 @@
+// error: mismatched types: expected 'int', found 'string'
+// error: undefined: 'nope'
+// error: struct 'P' has no field 'z'
+type P struct { x int }
+func f(a int) int { return a }
+func main() {
+    f("x")
+    println(nope)
+    p := P{x: 1}
+    println(p.z)
+}

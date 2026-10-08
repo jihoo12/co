@@ -1,0 +1,29 @@
+// expect: 3
+// expect: alice bob carol
+// expect: 2 1
+// expect: original copy
+type Team struct {
+    name    string
+    members []string
+}
+func (t &mut Team) add(m string) {
+    t.members = append(t.members, m)
+}
+func main() {
+    t := Team{name: "core"}
+    t.add("alice")
+    t.add("bob")
+    t.add("carol")
+    println(len(t.members))
+    println(t.members[0], t.members[1], t.members[2])
+
+    grid := [][]int{}
+    grid = append(grid, []int{1, 2})
+    grid = append(grid, []int{3})
+    println(len(grid[0]), len(grid[1]))
+
+    t2 := clone(&t)
+    t2.name = "copy"
+    t.name = "original"
+    println(t.name, t2.name)
+}

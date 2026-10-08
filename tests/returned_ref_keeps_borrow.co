@@ -1,0 +1,8 @@
+// error: cannot assign to 'a' because it is borrowed
+func first(a &[]int) &int { return &a[0] }
+func main() {
+    a := []int{1, 2}
+    r := first(&a)
+    a = []int{3}
+    println(*r)
+}

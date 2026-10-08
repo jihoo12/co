@@ -1,0 +1,18 @@
+// expect: 1000
+// Repeatedly reassigning owned values must free the old ones (checked with valgrind/asan manually).
+func make(n int) []string {
+    v := []string{}
+    for i := range n {
+        v = append(v, "item" + str(i))
+    }
+    return v
+}
+func main() {
+    v := make(1)
+    for i := range 1000 {
+        v = make(10)
+        s := v[0] + "x"
+        s = "y"
+    }
+    println(len(make(1000)))
+}

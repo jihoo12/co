@@ -1,0 +1,8 @@
+// error: cannot move out of 's' because it is borrowed
+func take(s string) {}
+func main() {
+    s := "x"
+    r := &s
+    take(s)
+    println(r)
+}

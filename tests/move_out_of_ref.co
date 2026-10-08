@@ -1,0 +1,6 @@
+// error: cannot move out of 'p.name' because it is behind a reference
+type P struct { name string }
+func f(p &P) string {
+    return p.name
+}
+func main() {}

@@ -1,0 +1,10 @@
+// error: 'inner' does not live long enough
+func main() {
+    a := 1
+    r := &a
+    {
+        inner := 5
+        r = &inner
+    }
+    println(*r)
+}

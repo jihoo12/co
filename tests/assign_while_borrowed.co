@@ -1,0 +1,7 @@
+// error: cannot assign to 'x' because it is borrowed
+func main() {
+    x := 1
+    r := &x
+    x = 2
+    println(*r)
+}

@@ -1,0 +1,6 @@
+// error: temporary value dropped while still borrowed
+func id(s &string) &string { return s }
+func main() {
+    var r &string = id(&"tmp")
+    println(r)
+}

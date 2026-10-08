@@ -1,0 +1,11 @@
+// expect: 3
+func inc(x &mut int) { *x += 1 }
+func incTwice(x &mut int) {
+    inc(x)        // implicit reborrow: x is still usable
+    inc(x)
+}
+func main() {
+    n := 1
+    incTwice(&mut n)
+    println(n)
+}

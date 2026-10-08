@@ -1,0 +1,7 @@
+// error: method 'inc' needs '&mut C'
+type C struct { n int }
+func (c &mut C) inc() { c.n++ }
+func f(c &C) {
+    c.inc()
+}
+func main() {}

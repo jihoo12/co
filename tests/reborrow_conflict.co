@@ -1,0 +1,8 @@
+// error: cannot use 'x' because it is mutably borrowed
+func main() {
+    x := 1
+    r := &mut x
+    r2 := &mut *r
+    println(x)
+    *r2 = 5
+}

@@ -1,0 +1,10 @@
+// error: 'p' does not live long enough
+type P struct { name string }
+func main() {
+    var r &string = &"x"
+    {
+        p := P{name: "inner"}
+        r = &p.name
+    }
+    println(r)
+}

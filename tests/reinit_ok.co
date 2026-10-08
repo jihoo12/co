@@ -1,0 +1,14 @@
+// expect: b
+// expect: 2
+func take(s string) {}
+func main() {
+    s := "a"
+    take(s)
+    s = "b"          // re-initialize after move: fine
+    println(s)
+    v := []string{"x"}
+    w := v
+    v = []string{"y", "z"}
+    println(len(v))
+    take(w[0] + "")
+}

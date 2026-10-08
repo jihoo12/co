@@ -1,0 +1,75 @@
+// A tour of co: Go-like syntax, Rust-like ownership.
+
+type Point struct {
+    x, y int
+}
+
+type Person struct {
+    name string
+    age  int
+    tags []string
+}
+
+func (p &Point) dist2() int {
+    return p.x*p.x + p.y*p.y
+}
+
+func (p &mut Point) shift(dx int, dy int) {
+    p.x += dx
+    p.y += dy
+}
+
+func (p &mut Person) addTag(tag string) {
+    p.tags = append(p.tags, tag)
+}
+
+func greet(p &Person) string {
+    return "hi " + p.name + ", age " + str(p.age)
+}
+
+func longest(a &string, b &string) &string {
+    if len(a) >= len(b) {
+        return a
+    }
+    return b
+}
+
+func fib(n int) int {
+    if n < 2 {
+        return n
+    }
+    return fib(n-1) + fib(n-2)
+}
+
+func main() {
+    var pt Point
+    pt.shift(3, 4)
+    println("dist2:", pt.dist2())
+
+    bob := Person{name: "Bob", age: 42}
+    bob.addTag("admin")
+    bob.addTag("ops")
+    println(greet(&bob), "tags:", len(bob.tags))
+    for i := range len(bob.tags) {
+        println(" -", bob.tags[i])
+    }
+
+    a := "hello"
+    b := "hi"
+    println("longest:", longest(&a, &b))
+
+    nums := []int{}
+    for i := 0; i < 10; i++ {
+        nums = append(nums, fib(i))
+    }
+    sum := 0
+    for i := range len(nums) {
+        sum += nums[i]
+    }
+    println("sum of fibs:", sum)
+
+    moved := bob          // ownership moves to `moved`
+    println(moved.name)
+    copy := clone(&moved) // explicit deep copy
+    println(copy.name, copy.age, 1.5 * 2.0, true)
+}
