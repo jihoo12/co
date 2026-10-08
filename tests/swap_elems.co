@@ -1,0 +1,30 @@
+// Two different elements of a slice can be changed at once; the compiler
+// checks at run time that the indices really differ.
+func swap(a mut int, b mut int) {
+    t := a
+    a = b
+    b = t
+}
+func sort(v mut []int) {
+    for i := range len(v) {
+        for j := i + 1; j < len(v); j++ {
+            if v[j] < v[i] { swap(v[i], v[j]) }
+        }
+    }
+}
+type P struct { xs [3]string }
+func swapS(a mut string, b mut string) {
+    t := a
+    a = b
+    b = t
+}
+func main() {
+    v := []int{5, 2, 9, 1}
+    sort(v)
+    println(v)
+    p := P{xs: [3]string{"a", "b", "c"}}
+    swapS(p.xs[0], p.xs[2])
+    println(p.xs)
+}
+// expect: [1, 2, 5, 9]
+// expect: [c, b, a]

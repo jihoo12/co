@@ -9,7 +9,7 @@ type Shape enum {
     Empty
 }
 type Color enum { Red, Green, Blue }
-func area(s &Shape) float {
+func area(s Shape) float {
     switch s {
     case Circle(r): return 3.14 * r * r
     case Rect(w, h): return w * h

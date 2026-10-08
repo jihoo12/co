@@ -1,0 +1,35 @@
+// `mut` parameters change the caller's value; others act like copies.
+type Counter struct { n int; log []string }
+
+func bump(c mut Counter) { c.n++; c.log = append(c.log, "bump") }
+func (c mut Counter) add(k int) { c.n += k }
+func (c Counter) total() int { return c.n }
+func double(x mut int) { x *= 2 }
+
+func local(c Counter) int {
+    c.n += 100                   // changes only this function's copy
+    c.add(1)
+    return c.n
+}
+
+func push(v mut []int, x int) { v = append(v, x) }
+
+func main() {
+    c := Counter{}
+    bump(c)
+    c.add(5)
+    println(c.total(), c.log)
+    println(local(c), c.n)
+    x := 21
+    double(x)
+    println(x)
+    v := []int{1}
+    push(v, len(v))              // reading v for another argument is fine
+    push(v, v[0])
+    println(v)
+    bump(Counter{})              // a temporary can be changed too
+}
+// expect: 6 [bump]
+// expect: 107 6
+// expect: 42
+// expect: [1, 1, 1]

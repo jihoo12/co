@@ -6,7 +6,7 @@ type Team struct {
     name    string
     members []string
 }
-func (t &mut Team) add(m string) {
+func (t mut Team) add(m string) {
     t.members = append(t.members, m)
 }
 func main() {
@@ -22,7 +22,7 @@ func main() {
     grid = append(grid, []int{3})
     println(len(grid[0]), len(grid[1]))
 
-    t2 := clone(&t)
+    t2 := clone(t)
     t2.name = "copy"
     t.name = "original"
     println(t.name, t2.name)

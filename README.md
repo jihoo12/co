@@ -1,8 +1,11 @@
 # co
 
-**co** is a small compiled language that aims to be **as easy to write as Go** while being
-**memory-safe without a garbage collector**, like Rust. It's written in C++ on top of LLVM and
-compiles to fast native executables.
+**co** is a small compiled language that aims to be **as easy to write as Go**, with
+**C's speed and reach** (no garbage collector, direct calls into C), while staying **memory-safe**.
+Everyday code has no pointers to manage and no borrow checker to fight: every variable holds its own
+value, and the compiler makes that cheap. When you need C's level of control, `unsafe` blocks give you
+raw pointers, and C libraries can be called directly. It's written in C++ on top of LLVM and compiles to fast native
+executables.
 
 ```go
 type Shape enum {
@@ -11,7 +14,7 @@ type Shape enum {
     Empty
 }
 
-func area(s &Shape) float {
+func area(s Shape) float {
     switch s {
     case Circle(r): return 3.14 * r * r
     case Rect(w, h): return w * h
@@ -19,7 +22,7 @@ func area(s &Shape) float {
     }
 }
 
-func find(names &[]string, want &string) ?int {
+func find(names []string, want string) ?int {
     for i, n := range names {
         if n == want { return i }
     }
@@ -39,11 +42,12 @@ func main() {
 ## Design goals
 
 1. **Easy first.** If you know Go (or Python, or JavaScript) you should be productive in an afternoon.
-   No lifetimes, no generics syntax, no traits, no `unwrap()` chains, no header files.
+   No references, no lifetimes, no "use of moved value", no generics syntax, no traits, no header files.
 2. **Safe by default.** No null pointers, no dangling references, no use-after-free, no double free,
-   no iterator invalidation. These are compile errors, not crashes.
+   no iterator invalidation, no data changing behind your back.
 3. **Helpful errors.** Every error says what went wrong *and* what to write instead.
-4. **Fast.** Values are freed the moment they're no longer owned, with no garbage collector.
+4. **Fast.** Values are freed the moment their variable goes away, with no garbage collector, and
+   copies are made only where a program could tell the difference.
 
 ## Building
 
@@ -126,15 +130,61 @@ for { break }                  // forever
 func add(a, b int) int { return a + b }
 ```
 
-Types: `int` (64-bit), `float` (64-bit), `bool`, `string`, slices `[]T`, maps `map[K]V`, structs, enums,
-optionals `?T`, results `!T`, `error`, and references `&T` / `&mut T`. For data with a fixed layout (and
+Types: `int` (64-bit), `float` (64-bit), `bool`, `string`, slices `[]T`, fixed-size arrays `[N]T`,
+maps `map[K]V`, structs, enums, optionals `?T`, results `!T`, `error`, and functions `func(T...) R`. For
+data with a fixed layout (and
 for C) there are also `int8` `int16` `int32` `uint8` (`byte`) `uint16` `uint32` `uint64` and `float32`;
 they wrap around on overflow. Number literals take whatever numeric type is needed (`var b byte = 200`,
 `x * 2.5`), and other conversions are explicit: `int32(n)`, `float(i)`, `uint8(x)` (float to integer
 conversions saturate).
 
+Integers can be written `255`, `0xff`, `0b1111_1111` or `0o377`. The bitwise operators are Go's:
+`&` `|` `^` `&^` (and not) `<<` `>>`, with `^x` (or `~x`) flipping every bit, and `&=`, `|=`, ... to
+update in place. Shifting by the type's width or more gives 0 (or -1 for negative signed numbers), never
+undefined behavior.
+
+```go
+flags := 0b0101
+flags |= 1 << 3              // set bit 3
+on := flags & (1 << 2) != 0  // test bit 2
+var b uint8 = 0xF0
+println(b >> 4, ^b)          // 15 15
+```
+
 Builtins: `println(...)`, `print(...)`, `len(x)`, `append(v, x)`, `clone(x)`, `str(x)`, `int(x)`,
 `float(x)`, `error(msg)`, `delete(m, k)`, `panic(msg)`. `println` can print anything, including structs, slices, enums and optionals.
+
+## Arrays
+
+`[N]T` holds exactly N values, stored inline (no heap), like C arrays. Arrays are values: assigning one
+copies it. Indexing is bounds-checked, `len(a)` is N, and `range` works as for slices.
+
+```go
+a := [5]int{1, 2, 3}         // the rest start at zero: [1, 2, 3, 0, 0]
+b := a                       // a copy
+b[0] = 100
+var grid [3][3]int
+grid[1][2] = 5
+for i, x := range a { }
+```
+
+## Functions as values
+
+A function's name, without calling it, is a function value of type `func(T...) R`. Function values can
+be stored, passed and called. They're plain function pointers, so C can call them too (they take and
+return numbers, bool, pointers and functions; closures aren't supported yet).
+
+```go
+func twice(x int) int { return x * 2 }
+func apply(f func(int) int, x int) int { return f(x) }
+
+type Button struct { onClick func(int) int }
+
+println(apply(twice, 21))           // 42
+b := Button{onClick: twice}
+println(b.onClick(4))               // 8
+var f func(int) int                 // nil until set
+```
 
 ## Structs and methods
 
@@ -143,11 +193,11 @@ type Point struct {
     x, y int
 }
 
-func (p &Point) dist2() int { return p.x*p.x + p.y*p.y }   // reads p
-func (p &mut Point) move(dx int) { p.x += dx }              // changes p
+func (p Point) dist2() int { return p.x*p.x + p.y*p.y }    // reads p
+func (p mut Point) move(dx int) { p.x += dx }              // changes p
 
 p := Point{x: 1, y: 2}      // missing fields get their zero value
-p.move(3)                   // no need to write &mut p: methods borrow automatically
+p.move(3)
 println(p, p.dist2())       // Point{x: 4, y: 2} 20
 ```
 
@@ -181,9 +231,7 @@ groups := map[string][]string{}
 groups["a"] = append(groups["a"], "x")   // grows the slice inside the map
 ```
 
-Keys can be `int`, `string` or `bool`. Keys are copied into the map, so `m[name] = 1` doesn't use up
-`name`. An empty `var m map[K]V` is ready to use, unlike Go's nil maps. A value read from a map of
-strings (or other owned data) is borrowed, so the map can't change while you're still using it.
+Keys can be `int`, `string` or `bool`. An empty `var m map[K]V` is ready to use, unlike Go's nil maps.
 
 ## Enums and switch
 
@@ -230,7 +278,7 @@ No `fallthrough`. `break` leaves the switch, as in Go.
 There is no `nil`. A value that might be missing has type `?T`:
 
 ```go
-func find(names &[]string, want &string) ?int {
+func find(names []string, want string) ?int {
     for i, n := range names {
         if n == want { return i }    // automatically becomes "some i"
     }
@@ -254,17 +302,17 @@ A function that can fail returns `!T`: "a `T`, or an error". There is one built-
 holds a message, so you never define error types.
 
 ```go
-func parsePort(text &string) !int {
+func parsePort(text string) !int {
     if text == "8080" { return 8080 }          // success is wrapped automatically
     return error("not a port: " + text)        // failure
 }
 
-func load(path &string) !Config {
+func load(path string) !Config {
     port := try parsePort(path)                // on error, return it to my caller
     return Config{port: port}
 }
 
-func save(c &Config) ! {                       // `!` alone: nothing, or an error
+func save(c Config) ! {                        // `!` alone: nothing, or an error
     if c.port == 0 { return error("no port") }
 }                                              // reaching the end means success
 ```
@@ -308,8 +356,8 @@ type Point struct {
 }
 
 func New(x, y int) Point { return Point{X: x, Y: y, label: "new"} }
-func (p &Point) Far() bool { return dist2(p) > 100 }
-func dist2(p &Point) int { return p.X*p.X + p.Y*p.Y }     // private
+func (p Point) Far() bool { return dist2(p) > 100 }
+func dist2(p Point) int { return p.X*p.X + p.Y*p.Y }      // private
 ```
 
 ```go
@@ -336,7 +384,8 @@ cycles are an error. `coc run main.co` compiles just that file as the main packa
 ## Calling C
 
 Declare C functions in an `extern` block, naming the library they come from (linked as `-lname`; leave
-the name out for the C library itself). Parameters and results are numbers, `bool` and C pointers `*T`:
+the name out for the C library itself). Parameters and results are numbers, `bool`, C pointers `*T` and
+functions:
 
 ```go
 extern "sqlite3" {
@@ -349,6 +398,11 @@ extern {
     func printf(format *byte, ...) int32      // variadic
     func memset(p *void, c int32, n uint64) *void
     func getenv(name *byte) *byte
+    func qsort(base *void, n uint64, size uint64, cmp func(a, b *void) int32)
+}
+
+func byValue(a *void, b *void) int32 {
+    unsafe { return *(*int32)(a) - *(*int32)(b) }
 }
 
 func main() {
@@ -361,91 +415,106 @@ func main() {
     memset(&mut buf, 65, 3)                  // a slice passes its elements
     printf("%s %d\n", "hi", int32(42))       // a string becomes a NUL-terminated copy
     if getenv("NOPE") == nil { println("unset") }
+
+    nums := []int32{5, 3, 9}
+    qsort(nums, 3, 4, byValue)               // C calls back into co
 }
 ```
 
 At a call to C, a `string` passed as `*byte` (or `*void`) becomes a temporary NUL-terminated copy, a
-slice passes a pointer to its elements, and `&x` / `&mut x` pass x's address; these are only valid during
-the call. C pointers can be `nil`, compared and stored, but not dereferenced in co. `*void` converts to and
-from any pointer, like in C. Use `coc build -L <dir>` for libraries outside the usual system directories
-(programs will look there at run time too). Not yet supported: C structs passed by value, and callbacks
-from C into co.
+slice or array passes a pointer to its elements, and `&x` / `&mut x` pass x's address; these are only
+valid during the call. C pointers can be `nil`, compared and stored anywhere; using what they point to
+takes an `unsafe` block (below). `*void` converts to and from any pointer, like in C. Use
+`coc build -L <dir>` for libraries outside the usual system directories (programs will look there at run
+time too). Not yet supported: C structs passed by value.
+
+## Pointers and `unsafe`
+
+Inside `unsafe { ... }`, C pointers work as they do in C. The compiler can't check that a pointer is
+valid, so the block marks where that's on you; everything outside it stays checked.
+
+```go
+extern {
+    func malloc(n uint64) *void
+    func free(p *void)
+}
+
+type Vec3 struct { x, y, z float32 }
+
+unsafe {
+    var p *Vec3 = malloc(uint64(sizeof(Vec3) * 10))
+    p[3].x = 1.5                    // index like an array (no bounds check)
+    p.y = 2                         // fields through a pointer, like Go
+    q := &p[3]                      // & gives a pointer, *T
+    *q = Vec3{x: 1}                 // read or write through it
+    reg := (*uint32)(0x4000_0000)   // a pointer from an address (memory-mapped hardware)
+    addr := uint64(p)               // and an address from a pointer (allowed anywhere)
+    free(p)
+}
+```
+
+Pointers can point to numbers, bool, pointers, functions, arrays and structs of those, which are the
+types C uses. A `string` or a slice can't be reached through a pointer, so co's own memory management
+can't be fooled. `sizeof(T)` gives a type's size in bytes, laid out as C lays it out.
 
 ---
 
-# Ownership in 5 rules
+# Values
 
-This is what lets co be safe without a garbage collector. You don't need to memorize it, because the
-compiler tells you exactly what to change. But here's the whole model:
+This is the whole memory model, and it's what lets co be safe without a garbage collector or a borrow
+checker you have to satisfy.
 
-**1. Each value has one owner, and it's freed when the owner goes away.**
-`string`, slices, and structs/enums containing them *move* when you assign them or pass them to
-a function by value. Numbers, bools, and plain structs of numbers are simply copied.
+**1. Every variable holds its own value.** Assigning or passing a value gives the receiver a value of
+its own. Changing one never changes the other, for strings, slices, maps and structs alike:
 
 ```go
-a := "hello"
-b := a            // the string moves to b
-println(a)        // error: borrow of moved value 'a'
-c := clone(b)     // want two copies? say so.
+a := []int{1, 2}
+b := a            // b is a separate slice
+b[0] = 9
+println(a, b)     // [1, 2] [9, 2]
 ```
 
-**2. Lend values with references instead of giving them away.**
-A parameter declared `&T` *borrows* the argument. You don't write anything at the call site:
+This doesn't mean copying everything. When the original isn't used again, the value is simply moved:
+no copy at all. A copy is made only where the program could tell the difference, as in the example
+above, where `a` is printed after `b` changed.
+
+**2. Parameters are read-only views; `mut` parameters change the caller's value.**
+A function gets its arguments without copying them. If it changes a parameter (or keeps it, say by
+returning it or storing it in a struct), it simply gets its own copy instead, as if the argument had been
+assigned to it. To change the caller's variable, write `mut` before the type:
 
 ```go
-func shout(s &string) { println(s + "!") }
+func shout(s string) string { return s + "!" }     // looks at s; nothing is copied
+func reset(c mut Counter) { c.n = 0 }               // changes the caller's counter
 
 msg := "hi"
-shout(msg)        // msg is lent, not given away
-println(msg)      // still yours
+shout(msg)
+reset(counter)
+println(msg, counter.n)                             // hi 0
 ```
 
-If you forget and declare `func shout(s string)`, the error message tells you to add the `&`.
+Methods work the same way: `func (p Point) dist2() int` reads the point, and
+`func (p mut Point) move(dx int)` changes it.
 
-**3. Changing something requires `&mut`, visibly.**
-A function that modifies its argument takes `&mut T`, and the caller writes `&mut x`. You can always see
-at a glance which calls may change your data. (Method calls borrow automatically.)
+**3. Values are freed when their variable goes away.** Strings, slices and maps live on the heap and are
+freed at the end of the block that owns them. There are no references that could outlive them, so
+nothing can dangle.
 
-```go
-func reset(c &mut Counter) { c.n = 0 }
-reset(&mut counter)
-```
-
-**4. Either many readers or one writer.**
-While something is borrowed, it can't be changed, moved or freed. A borrow lasts only until its
-last use, so this works:
-
-```go
-first := &v[0]
-println(first)        // last use of `first`
-v = append(v, 4)      // fine
-```
-
-but this is caught at compile time instead of crashing at runtime:
+**4. Looping over something while changing it is fine.** `for x := range v` goes over `v` as it
+was when the loop started. If the loop body changes `v`, the compiler loops over a copy; otherwise it
+looks at `v` in place. `switch` works the same way.
 
 ```go
 for _, x := range v {
-    v = append(v, x)  // error: v is borrowed by the loop
+    v = append(v, x)   // fine: the loop still sees the original two elements
 }
 ```
 
-**5. References can't outlive what they point to.**
-Functions can return references only into their reference parameters, never to their own local
-variables, and references can't be stored inside structs or slices. That's why co never needs
-Rust-style lifetime annotations.
-
-```go
-func longest(a &string, b &string) &string {   // fine: returns one of its parameters
-    if len(a) >= len(b) { return a }
-    return b
-}
-```
-
-### Looking without taking
-
-`switch`, `for ... range` and `or` never take ownership of a variable they look into. Owned data inside
-comes out *borrowed*. For example, `u.nick or "anon"` doesn't empty `u.nick`. When used on a fresh value
-(like a function's result), you get the value itself.
+The one thing co rejects is passing the same variable to two parameters at once when one of them
+may change it, like `swap(x, x)` or `fill(v, v)`. A function changing one of its arguments shouldn't
+see another of its arguments change underneath it. Different parts of one value are fine:
+`swap(p.a, p.b)`, and `swap(v[i], v[j])`, where the program checks that `i != j` when it runs (and stops
+with a clear message if they're equal).
 
 ### Runtime checks
 
@@ -466,9 +535,9 @@ source ─► lexer ─► parser ─► AST ─► sema ─► MIR ─► borro
 | `src/loader.cpp`      | finds the main package's files and, through imports, every package   |
 | `src/lexer.cpp`       | tokens + Go-style automatic semicolons                               |
 | `src/parser.cpp`      | recursive-descent parser producing the AST (`src/ast.h`)             |
-| `src/sema.cpp`        | types, methods, enums, auto-borrowing, optionals, exhaustiveness      |
-| `src/mir_build.cpp`   | lowers to MIR, a control-flow graph with explicit moves, drops and scope ends |
-| `src/borrowck.cpp`    | move/initialization dataflow, liveness, region inference, loan conflicts (NLL-style) |
+| `src/sema.cpp`        | types, methods, enums, how parameters are passed, optionals, exhaustiveness |
+| `src/mir_build.cpp`   | lowers to MIR, a control-flow graph with explicit moves, copies, drops and scope ends |
+| `src/borrowck.cpp`    | checks the references the compiler made: initialization, liveness, regions, conflicts |
 | `src/codegen.cpp`     | MIR → LLVM IR, drop flags, generated drop/clone/print glue, optimization |
 | `runtime/runtime.c`   | printing, strings, slices, maps, panics                              |
 | `runtime/co_abi.h`    | memory layouts shared by the runtime and codegen                     |
@@ -486,12 +555,24 @@ each runtime call against the runtime's real signature, and both sides share the
 `bench/` has small programs with Go twins in `bench/go/`; `python3 bench/run.py build/bin/coc`
 times both (set `$GO` if `go` isn't on PATH).
 
-The borrow checker follows rustc's design: each local holding a reference gets a *region* (the set of
-program points where it may still be used); each `&`/`&mut` creates a *loan* that must stay valid
-for the regions of all references derived from it. A forward dataflow tracks live loans and reports
-any access that conflicts with one.
+### How values stay cheap
+
+Under the hood co still uses references; they're just never written by the programmer.
+
+- **Parameters.** Sema decides how each parameter is passed. Numbers and plain structs go by value.
+  Other types are passed as a read-only reference, unless the function body changes the parameter or
+  keeps it (returns it, stores it, ...); then the function takes the value itself. `mut T` is a
+  mutable reference. Inside the function, every reference reads as the value it refers to.
+- **Moves and copies.** The MIR builder hands values on by moving them. A liveness pass then turns each
+  move out of a variable that is still used afterwards into a move out of a fresh copy. Values taken
+  out of fields, elements or references are always copied.
+- **The borrow checker** (rustc's design: regions, loans, NLL-style liveness) checks the references the
+  compiler made. With the rules above, the only conflict a program can produce is one variable passed
+  to two parameters where one changes it; everything else is a check on the compiler itself. When two
+  uses differ only in a slice index (`v[i]` and `v[j]`), it inserts a run-time check that the indices
+  differ instead of rejecting the program.
 
 ## Not yet supported
 
-Generics, interfaces, closures, bitwise operators, a standard library of packages, string functions (split, indexing, ...), references
-inside structs.
+Generics, interfaces, closures, a standard library of packages, string functions (split, indexing, ...),
+C structs passed by value, and building without the C library (for kernels and microcontrollers).

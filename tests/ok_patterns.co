@@ -1,35 +1,27 @@
 // expect: 6
 // expect: ab
 // expect: 10
-// expect: 2
 type Acc struct { total int; log []string }
-func (a &mut Acc) add(n int) &mut Acc {
-    a.total += n
-    return a
-}
-func (a &Acc) last() &string { return &a.log[len(&a.log)-1] }
-func biggest(v &[]int) &int {
-    best := &v[0]
+func (a mut Acc) add(n int) { a.total += n }
+func (a Acc) last() string { return a.log[len(a.log)-1] }
+func biggest(v []int) int {
+    best := v[0]
     for i := range len(v) {
-        if v[i] > *best { best = &v[i] }
+        if v[i] > best { best = v[i] }
     }
     return best
 }
 func main() {
     acc := Acc{}
-    acc.add(1).add(2).add(3)          // chained &mut reborrows
+    acc.add(1)
+    acc.add(2)
+    acc.add(3)
     println(acc.total)
     acc.log = append(acc.log, "a")
     acc.log = append(acc.log, "ab")
     l := acc.last()
+    acc.log = append(acc.log, "c")    // l is a value of its own
     println(l)
-    acc.log = append(acc.log, "c")    // l is no longer used: fine
     v := []int{3, 10, 7}
-    println(*biggest(&v))
-    {
-        x := 1
-        r := &mut x
-        *r += 1
-        println(x)                    // r's borrow already ended
-    }
+    println(biggest(v))
 }

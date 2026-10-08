@@ -1,0 +1,10 @@
+// error: 'x' is passed to be changed twice at once
+// error: cannot change 'v' while it is also in use
+func swap(a mut int, b mut int) {}
+func fill(dst mut []int, src []int) {}
+func main() {
+    x := 1
+    swap(x, x)          // both parameters would be the same variable
+    v := []int{1}
+    fill(v, v)
+}

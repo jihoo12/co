@@ -1,0 +1,47 @@
+// Inside `unsafe`, C pointers can be read, written and indexed directly.
+extern {
+    func malloc(n uint64) *void
+    func calloc(n uint64, size uint64) *void
+    func free(p *void)
+}
+
+type Vec3 struct { x, y, z float32; tag uint8 }
+
+func sum(p *int32, n int) int {
+    t := 0
+    unsafe {
+        for i := range n { t += int(p[i]) }
+    }
+    return t
+}
+
+func main() {
+    println(sizeof(Vec3), sizeof(int32), sizeof(bool), sizeof(*void))
+    unsafe {
+        var p *Vec3 = calloc(3, uint64(sizeof(Vec3)))
+        for i := range 3 {
+            p[i].x = float32(i)
+            p[i].tag = uint8(i * 10)
+        }
+        p.y = 2.5                // the first element
+        q := &p[2]
+        q.z = 9
+        println(p[0], p[1].tag, p[2])
+
+        var ints *int32 = malloc(16)
+        for i := range 4 { ints[i] = int32(i * i) }
+        *ints = 42
+        println(*ints, ints[3], sum(ints, 4))
+
+        v := 7
+        pv := &v
+        *pv += 1
+        println(v, pv != nil)
+        free(p)
+        free(ints)
+    }
+}
+// expect: 16 4 1 8
+// expect: Vec3{x: 0, y: 2.5, z: 0, tag: 0} 10 Vec3{x: 2, y: 0, z: 9, tag: 20}
+// expect: 42 9 56
+// expect: 8 true

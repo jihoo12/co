@@ -1,16 +1,16 @@
 // expect: hello world 11
 // expect: 2
 type Counter struct { n int }
-func shout(s &string, t &string) int {
+func shout(s string, t string) int {
     println(s, t, len(s) + len(t) + 1)
     return 0
 }
-func bump(c &mut Counter) { c.n++ }
+func bump(c mut Counter) { c.n++ }
 func main() {
     a := "hello"
     b := "world"
-    shout(a, b)          // borrowed automatically, still usable afterwards
+    shout(a, b)          // passed without copying, still usable afterwards
     println(len(a) - 3)
     c := Counter{}
-    bump(&mut c)         // mutation is always visible at the call site
+    bump(c)
 }

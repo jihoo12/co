@@ -1,6 +1,8 @@
 #include "lexer.h"
 
 #include <cctype>
+#include <cstring>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace co {
@@ -37,6 +39,7 @@ const char *tokName(Tok t) {
   case Tok::KwImport: return "'import'";
   case Tok::KwExtern: return "'extern'";
   case Tok::KwNil: return "'nil'";
+  case Tok::KwUnsafe: return "'unsafe'";
   case Tok::Question: return "'?'";
   case Tok::LParen: return "'('";
   case Tok::RParen: return "')'";
@@ -73,6 +76,18 @@ const char *tokName(Tok t) {
   case Tok::PercentAssign: return "'%='";
   case Tok::PlusPlus: return "'++'";
   case Tok::MinusMinus: return "'--'";
+  case Tok::Pipe: return "'|'";
+  case Tok::Caret: return "'^'";
+  case Tok::Tilde: return "'~'";
+  case Tok::Shl: return "'<<'";
+  case Tok::Shr: return "'>>'";
+  case Tok::AndNot: return "'&^'";
+  case Tok::AmpAssign: return "'&='";
+  case Tok::PipeAssign: return "'|='";
+  case Tok::CaretAssign: return "'^='";
+  case Tok::ShlAssign: return "'<<='";
+  case Tok::ShrAssign: return "'>>='";
+  case Tok::AndNotAssign: return "'&^='";
   }
   return "?";
 }
@@ -112,6 +127,7 @@ std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag) {
       {"default", Tok::KwDefault}, {"none", Tok::KwNone},  {"or", Tok::KwOr},
       {"try", Tok::KwTry},       {"map", Tok::KwMap},     {"import", Tok::KwImport},
       {"extern", Tok::KwExtern}, {"nil", Tok::KwNil},
+      {"unsafe", Tok::KwUnsafe},
   };
 
   std::vector<Token> toks;
@@ -182,6 +198,34 @@ std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag) {
       auto it = keywords.find(id);
       tok.kind = it != keywords.end() ? it->second : Tok::Ident;
       tok.text = id;
+      toks.push_back(tok);
+      continue;
+    }
+
+    // 0x1F, 0b1010, 0o17 (digits may be separated by '_')
+    if (c == '0' && strchr("xXbBoO", peek(1)) && peek(1) != '\0') {
+      char p = (char)tolower(peek(1));
+      int base = p == 'x' ? 16 : p == 'b' ? 2 : 8;
+      advance();
+      advance();
+      std::string digits;
+      while (isxdigit((unsigned char)peek()) || peek() == '_') {
+        if (peek() != '_')
+          digits += peek();
+        advance();
+      }
+      tok.kind = Tok::Int;
+      tok.text = digits;
+      try {
+        size_t used = 0;
+        tok.intVal = (int64_t)std::stoull(digits, &used, base);
+        if (used != digits.size())
+          diag.error(loc, "invalid digit in base-" + std::to_string(base) + " literal");
+      } catch (std::out_of_range &) {
+        diag.error(loc, "integer literal is too large");
+      } catch (...) {
+        diag.error(loc, "expected digits after '0" + std::string(1, p) + "'");
+      }
       toks.push_back(tok);
       continue;
     }
@@ -301,22 +345,47 @@ std::vector<Token> lex(const std::string &src, int file, Diagnostics &diag) {
     case ':': tok.kind = two('=', Tok::Define, Tok::Colon); break;
     case '=': tok.kind = two('=', Tok::Eq, Tok::Assign); break;
     case '!': tok.kind = two('=', Tok::Ne, Tok::Not); break;
-    case '<': tok.kind = two('=', Tok::Le, Tok::Lt); break;
-    case '>': tok.kind = two('=', Tok::Ge, Tok::Gt); break;
+    case '<':
+    case '>': {
+      // < <= << <<=, and the same with >
+      bool less = c == '<';
+      advance();
+      if (peek() == c) {
+        advance();
+        tok.kind = less ? Tok::Shl : Tok::Shr;
+        if (peek() == '=') {
+          advance();
+          tok.kind = less ? Tok::ShlAssign : Tok::ShrAssign;
+        }
+      } else if (peek() == '=') {
+        advance();
+        tok.kind = less ? Tok::Le : Tok::Ge;
+      } else {
+        tok.kind = less ? Tok::Lt : Tok::Gt;
+      }
+      break;
+    }
     case '*': tok.kind = two('=', Tok::StarAssign, Tok::Star); break;
     case '/': tok.kind = two('=', Tok::SlashAssign, Tok::Slash); break;
     case '%': tok.kind = two('=', Tok::PercentAssign, Tok::Percent); break;
-    case '&': tok.kind = two('&', Tok::AndAnd, Tok::Amp); break;
+    case '&':
+      advance();
+      if (peek() == '&') { advance(); tok.kind = Tok::AndAnd; }
+      else if (peek() == '=') { advance(); tok.kind = Tok::AmpAssign; }
+      else if (peek() == '^') {
+        advance();
+        tok.kind = Tok::AndNot;
+        if (peek() == '=') { advance(); tok.kind = Tok::AndNotAssign; }
+      } else tok.kind = Tok::Amp;
+      break;
     case '|':
       advance();
-      if (peek() == '|') {
-        advance();
-        tok.kind = Tok::OrOr;
-      } else {
-        diag.error(loc, "unexpected character '|'");
-        continue;
-      }
+      if (peek() == '|') { advance(); tok.kind = Tok::OrOr; }
+      else if (peek() == '=') { advance(); tok.kind = Tok::PipeAssign; }
+      else tok.kind = Tok::Pipe;
       break;
+    case '^': tok.kind = two('=', Tok::CaretAssign, Tok::Caret); break;
+    case '~': advance(); tok.kind = Tok::Tilde; break;
     case '+':
       advance();
       if (peek() == '+') { advance(); tok.kind = Tok::PlusPlus; }

@@ -101,10 +101,9 @@ int main(int argc, char **argv) {
     diag.print();
     return 1;
   }
-  mir::Module mod = buildMir(*prog, tc, diag);
-  if (!diag.hasErrors())
-    for (auto &f : mod.funcs)
-      borrowCheck(f, diag);
+  mir::Module mod = buildMir(*prog, tc);
+  for (auto &f : mod.funcs)
+    borrowCheck(f, diag);
   if (emitMir) {
     std::string out;
     for (auto &f : mod.funcs)

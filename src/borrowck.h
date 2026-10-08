@@ -8,6 +8,8 @@ namespace co {
 //  * no conflicting borrows: many `&` or exactly one `&mut` at a time
 //  * no borrow outlives the value it points to
 // Borrows last only as long as they are used (non-lexical lifetimes).
-void borrowCheck(const mir::Function &f, Diagnostics &diag);
+// Two uses of different elements of one slice (`swap(v[i], v[j])`) are
+// allowed: a CheckDistinct statement is added to check the indices at run time.
+void borrowCheck(mir::Function &f, Diagnostics &diag);
 
 } // namespace co

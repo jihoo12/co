@@ -3,7 +3,7 @@
 // error: C can't use 'string' through a pointer
 // error: cannot pass 'int' to C as '*uint8'
 // error: cannot pass 'Point' to C as '*Point' (pass '&p' to give C its address)
-// error: C pointers can't be dereferenced in co
+// error: reading or writing through a C pointer can only be done inside 'unsafe { ... }'
 // error: constant 200 overflows 'int8'
 // error: negative constant overflows 'uint32'
 // error: mismatched types 'int32' and 'int' in binary operation

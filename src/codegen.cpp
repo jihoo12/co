@@ -123,11 +123,13 @@ private:
     case TypeKind::IntN: return llvm::IntegerType::get(ctx_, t->bits);
     case TypeKind::Float32: return llvm::Type::getFloatTy(ctx_);
     case TypeKind::Ptr:
-    case TypeKind::Nil: return ptrTy_;
+    case TypeKind::Nil:
+    case TypeKind::Func: return ptrTy_;
     case TypeKind::Bool: return i1_;
     case TypeKind::String:
     case TypeKind::Error:
     case TypeKind::Slice: return vecTy_;
+    case TypeKind::Array: return llvm::ArrayType::get(lt(t->inner), (uint64_t)t->len);
     case TypeKind::Ref: return ptrTy_;
     case TypeKind::Map: return mapTy_;
     case TypeKind::None: return i64_;
@@ -306,6 +308,12 @@ private:
       }
       break;
     }
+    case TypeKind::Array: {
+      llvm::Function *elemDrop = dropFn(t->inner);
+      llvm::Type *et = lt(t->inner);
+      emitLoop(ib, ib.getInt64(t->len), [&](llvm::Value *i) { ib.CreateCall(elemDrop, {ib.CreateGEP(et, p, i)}); });
+      break;
+    }
     case TypeKind::Enum:
       forEachVariant(ib, t, p, [&](int v, llvm::Value *payload) {
         auto *vt = variantTy(t, v);
@@ -371,14 +379,17 @@ private:
     case TypeKind::Bool:
     case TypeKind::IntN:
     case TypeKind::Float32:
-    case TypeKind::Ptr: printScalar(ib, t, ib.CreateLoad(lt(t), p)); break;
+    case TypeKind::Ptr:
+    case TypeKind::Func: printScalar(ib, t, ib.CreateLoad(lt(t), p)); break;
     case TypeKind::String:
     case TypeKind::Error: ib.CreateCall(rt("co_print_str", void_, {ptrTy_}), {p}); break;
     case TypeKind::Ref: ib.CreateCall(printFn(t->inner), {ib.CreateLoad(ptrTy_, p)}); break;
-    case TypeKind::Slice: {
+    case TypeKind::Slice:
+    case TypeKind::Array: {
       text("[");
-      llvm::Value *data = ib.CreateLoad(ptrTy_, ib.CreateStructGEP(vecTy_, p, 0));
-      llvm::Value *len = ib.CreateLoad(i64_, ib.CreateStructGEP(vecTy_, p, 1));
+      bool arr = t->kind == TypeKind::Array;
+      llvm::Value *data = arr ? p : ib.CreateLoad(ptrTy_, ib.CreateStructGEP(vecTy_, p, 0));
+      llvm::Value *len = arr ? (llvm::Value *)ib.getInt64(t->len) : ib.CreateLoad(i64_, ib.CreateStructGEP(vecTy_, p, 1));
       llvm::Function *ep = printFn(t->inner);
       llvm::Type *et = lt(t->inner);
       emitLoop(ib, len, [&](llvm::Value *i) {
@@ -497,6 +508,11 @@ private:
             ib.CreateCall(cloneFn(fields[i]),
                           {ib.CreateStructGEP(vt, dpay, (unsigned)i), ib.CreateStructGEP(vt, spay, (unsigned)i)});
       });
+    } else if (t->kind == TypeKind::Array) {
+      llvm::Function *ec = cloneFn(t->inner);
+      llvm::Type *et = lt(t->inner);
+      emitLoop(ib, ib.getInt64(t->len),
+               [&](llvm::Value *i) { ib.CreateCall(ec, {ib.CreateGEP(et, dst, i), ib.CreateGEP(et, src, i)}); });
     } else if (t->kind == TypeKind::Struct) {
       auto *st = lt(t);
       for (size_t i = 0; i < t->st->fields.size(); i++) {
@@ -578,6 +594,20 @@ private:
         ty = ty->st->fields[pr.field].type;
         break;
       case Proj::Index: {
+        if (ty->isPtr()) { // p[i] through a C pointer: no length to check
+          llvm::Value *ptr = b_.CreateLoad(ptrTy_, v);
+          ty = ty->inner;
+          v = b_.CreateGEP(lt(ty), ptr, b_.CreateLoad(i64_, slots_[pr.indexLocal]));
+          break;
+        }
+        if (ty->kind == TypeKind::Array) {
+          llvm::Value *idx = b_.CreateLoad(i64_, slots_[pr.indexLocal]);
+          llvm::Value *len = b_.getInt64(ty->len);
+          panicIf(b_.CreateICmpUGE(idx, len), nullptr, idx, len);
+          ty = ty->inner;
+          v = b_.CreateGEP(lt(ty), v, idx);
+          break;
+        }
         llvm::Value *data = b_.CreateLoad(ptrTy_, b_.CreateStructGEP(vecTy_, v, 0));
         llvm::Value *len = b_.CreateLoad(i64_, b_.CreateStructGEP(vecTy_, v, 1));
         llvm::Value *idx = b_.CreateLoad(i64_, slots_[pr.indexLocal]);
@@ -605,6 +635,7 @@ private:
       case Constant::Float: return llvm::ConstantFP::get(lt(o.type), o.c.f);
       case Constant::Bool: return llvm::ConstantInt::get(i1_, o.c.b);
       case Constant::Zero: return llvm::Constant::getNullValue(lt(o.type));
+      case Constant::Func: return funcPtr(o.c.fn);
       }
       return nullptr;
     case Operand::Copy:
@@ -661,6 +692,24 @@ private:
     case BinOp::Le: return isSigned ? b_.CreateICmpSLE(l, r) : b_.CreateICmpULE(l, r);
     case BinOp::Gt: return isSigned ? b_.CreateICmpSGT(l, r) : b_.CreateICmpUGT(l, r);
     case BinOp::Ge: return isSigned ? b_.CreateICmpSGE(l, r) : b_.CreateICmpUGE(l, r);
+    case BinOp::BitAnd: return b_.CreateAnd(l, r);
+    case BinOp::BitOr: return b_.CreateOr(l, r);
+    case BinOp::BitXor: return b_.CreateXor(l, r);
+    case BinOp::AndNot: return b_.CreateAnd(l, b_.CreateNot(r));
+    case BinOp::Shl:
+    case BinOp::Shr: {
+      // Like Go: the count is unsigned, and shifting by the width or more
+      // gives 0 (or all sign bits for a negative signed value), never poison.
+      auto *ty = llvm::cast<llvm::IntegerType>(l->getType());
+      unsigned bits = ty->getBitWidth();
+      llvm::Value *tooBig = b_.CreateICmpUGE(r, llvm::ConstantInt::get(r->getType(), bits));
+      llvm::Value *n = b_.CreateZExtOrTrunc(r, ty);
+      if (op == BinOp::Shl)
+        return b_.CreateSelect(tooBig, llvm::ConstantInt::get(ty, 0), b_.CreateShl(l, n));
+      if (!isSigned)
+        return b_.CreateSelect(tooBig, llvm::ConstantInt::get(ty, 0), b_.CreateLShr(l, n));
+      return b_.CreateAShr(l, b_.CreateSelect(tooBig, llvm::ConstantInt::get(ty, bits - 1), n));
+    }
     default: return nullptr;
     }
   }
@@ -679,7 +728,7 @@ private:
       b_.CreateCall(printFn(t->inner), {v});
       return;
     }
-    if (t->isNumeric() || t->kind == TypeKind::Bool || t->isPtr())
+    if (t->isNumeric() || t->kind == TypeKind::Bool || t->isPtr() || t->isFunc())
       printScalar(b_, t, v);
   }
 
@@ -696,7 +745,8 @@ private:
     case TypeKind::Float: ib.CreateCall(rt("co_print_float", void_, {f64_}), {v}); break;
     case TypeKind::Float32: ib.CreateCall(rt("co_print_float", void_, {f64_}), {ib.CreateFPExt(v, f64_)}); break;
     case TypeKind::Bool: ib.CreateCall(rt("co_print_bool", void_, {i32_}), {ib.CreateZExt(v, i32_)}); break;
-    case TypeKind::Ptr: ib.CreateCall(rt("co_print_ptr", void_, {ptrTy_}), {v}); break;
+    case TypeKind::Ptr:
+    case TypeKind::Func: ib.CreateCall(rt("co_print_ptr", void_, {ptrTy_}), {v}); break;
     default: break;
     }
   }
@@ -706,6 +756,11 @@ private:
     llvm::Type *dt = lt(to);
     if (from == to)
       return v;
+    bool fromPtr = from->isPtr() || from->isFunc(), toPtr = to->isPtr() || to->isFunc();
+    if (fromPtr)
+      return toPtr ? v : b_.CreatePtrToInt(v, dt);
+    if (toPtr)
+      return b_.CreateIntToPtr(b_.CreateIntCast(v, i64_, from->isSigned()), dt);
     if (from->isInteger() && to->isInteger())
       return b_.CreateIntCast(v, dt, from->isSigned());
     if (from->isInteger())
@@ -718,26 +773,47 @@ private:
 
   // ----- calling C -----
 
-  // Declares C function `f`. Integers narrower than int are extended by the
-  // caller, as C compilers expect.
+  // Integers narrower than int are extended to 32 bits when passed to or
+  // returned from C, as C compilers expect.
+  static llvm::Attribute::AttrKind extAttr(Type *t) {
+    if (t->kind == TypeKind::Bool || (t->kind == TypeKind::IntN && t->bits < 32))
+      return t->isSigned() ? llvm::Attribute::SExt : llvm::Attribute::ZExt;
+    return llvm::Attribute::None;
+  }
+  void addExtAttrs(llvm::Function *fn, const std::vector<Type *> &params, Type *ret) {
+    for (size_t i = 0; i < params.size(); i++)
+      if (auto a = extAttr(params[i]); a != llvm::Attribute::None)
+        fn->addParamAttr((unsigned)i, a);
+    if (auto a = extAttr(ret); a != llvm::Attribute::None)
+      fn->addRetAttr(a);
+  }
+
+  llvm::FunctionType *funcType(Type *ft) {
+    std::vector<llvm::Type *> params;
+    for (Type *p : ft->params)
+      params.push_back(lt(p));
+    return llvm::FunctionType::get(ft->inner->kind == TypeKind::Void ? void_ : lt(ft->inner), params, false);
+  }
+
+  // A pointer to function `f`, callable from C. co functions used this way
+  // follow C's rules for small integers too.
+  llvm::Value *funcPtr(FuncInfo *f) {
+    if (f->isExtern)
+      return externFn(f).getCallee();
+    llvm::Function *fn = fns_.at(f);
+    addExtAttrs(fn, f->params, f->ret);
+    return fn;
+  }
+
+  // Declares C function `f`.
   llvm::FunctionCallee externFn(FuncInfo *f) {
     std::vector<llvm::Type *> params;
     for (Type *p : f->params)
       params.push_back(lt(p));
     auto *fty = llvm::FunctionType::get(f->ret->kind == TypeKind::Void ? void_ : lt(f->ret), params, f->variadic);
     auto callee = mod_.getOrInsertFunction(f->symbol, fty);
-    auto ext = [](Type *t) {
-      if (t->kind == TypeKind::Bool || (t->kind == TypeKind::IntN && t->bits < 32))
-        return t->isSigned() ? llvm::Attribute::SExt : llvm::Attribute::ZExt;
-      return llvm::Attribute::None;
-    };
-    if (auto *fn = llvm::dyn_cast<llvm::Function>(callee.getCallee()); fn && fn->getFunctionType() == fty) {
-      for (size_t i = 0; i < f->params.size(); i++)
-        if (auto a = ext(f->params[i]); a != llvm::Attribute::None)
-          fn->addParamAttr((unsigned)i, a);
-      if (auto a = ext(f->ret); a != llvm::Attribute::None)
-        fn->addRetAttr(a);
-    }
+    if (auto *fn = llvm::dyn_cast<llvm::Function>(callee.getCallee()); fn && fn->getFunctionType() == fty)
+      addExtAttrs(fn, f->params, f->ret);
     return callee;
   }
 
@@ -786,7 +862,7 @@ private:
     }
     case Rvalue::UnaryOp: {
       llvm::Value *v = operand(rv.ops[0]);
-      if (rv.uop == UnOp::Not)
+      if (rv.uop == UnOp::Not || rv.uop == UnOp::BitNot)
         return b_.CreateNot(v);
       return rv.type->isFloat() ? b_.CreateFNeg(v) : b_.CreateNeg(v);
     }
@@ -832,6 +908,19 @@ private:
       return b_.CreateLoad(vecTy_, vec);
     }
     case Rvalue::Call: {
+      if (!rv.func) { // through a function value, which C may have made: use C's conventions
+        Type *ft = rv.ops[0].type;
+        std::vector<llvm::Value *> args;
+        for (size_t i = 1; i < rv.ops.size(); i++)
+          args.push_back(operand(rv.ops[i]));
+        llvm::CallInst *call = b_.CreateCall(funcType(ft), operand(rv.ops[0]), args);
+        for (size_t i = 0; i < ft->params.size(); i++)
+          if (auto a = extAttr(ft->params[i]); a != llvm::Attribute::None)
+            call->addParamAttr((unsigned)i, a);
+        if (auto a = extAttr(ft->inner); a != llvm::Attribute::None)
+          call->addRetAttr(a);
+        return ft->inner->kind == TypeKind::Void ? nullptr : call;
+      }
       if (rv.func->isExtern)
         return externCall(rv);
       std::vector<llvm::Value *> args;
@@ -862,6 +951,8 @@ private:
         b_.CreateCall(rt("co_print_newline", void_, {}), {});
       return nullptr;
     case BuiltinOp::Len:
+      if (rv.ops[0].type->derefAll()->kind == TypeKind::Array)
+        return b_.getInt64(rv.ops[0].type->derefAll()->len);
       return b_.CreateLoad(i64_, b_.CreateStructGEP(vecTy_, a[0], 1));
     case BuiltinOp::Append:
     case BuiltinOp::Push: {
@@ -1011,6 +1102,10 @@ private:
       if (flags_[s.place.local])
         dropLocal(s.place.local);
       return;
+    case Statement::CheckDistinct:
+      panicIf(b_.CreateICmpEQ(b_.CreateLoad(i64_, slots_[s.local]), b_.CreateLoad(i64_, slots_[s.local2])),
+              "the same element is used twice at once (one use changes it)");
+      break;
     case Statement::StorageDead:
     case Statement::Nop:
       return;

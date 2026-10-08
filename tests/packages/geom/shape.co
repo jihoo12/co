@@ -3,7 +3,7 @@ type Shape enum {
     Rect(w, h int)
 }
 
-func Area(s &Shape) int {
+func Area(s Shape) int {
     a := 0
     switch s {
     case Circle(r): a = 3 * square(r)
@@ -13,6 +13,6 @@ func Area(s &Shape) int {
 }
 
 // Far uses dist2, an unexported method declared in point.co.
-func Far(p &Point) bool { return p.dist2() > 100 }
+func Far(p Point) bool { return p.dist2() > 100 }
 
 func square(n int) int { return n * n }

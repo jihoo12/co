@@ -12,7 +12,7 @@ func main() {
     most := 0
     for w, n := range counts {
         if n > most {
-            best = clone(w)
+            best = w
             most = n
         }
     }
@@ -21,7 +21,7 @@ func main() {
 
     byLength := map[int][]string{}
     for w, _ := range counts {
-        byLength[len(w)] = append(byLength[len(w)], clone(w))
+        byLength[len(w)] = append(byLength[len(w)], w)
     }
     println(byLength)
 }

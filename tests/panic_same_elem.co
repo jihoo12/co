@@ -1,0 +1,9 @@
+// exit: 101
+// stderr: the same element is used twice at once
+func swap(a mut int, b mut int) {}
+func main() {
+    v := []int{1, 2}
+    i := 1
+    j := 1
+    swap(v[i], v[j])
+}

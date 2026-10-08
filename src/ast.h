@@ -13,33 +13,44 @@ namespace co {
 // ----- Type syntax -----
 
 struct TypeExpr {
-  enum Kind { Name, Ref, Slice, Optional, Result, Map, Ptr } kind = Name; // Result: `!T`, or `!` (inner null)
+  // Mut: `mut T`, a parameter the function may change (passed by reference).
+  // Ref: `&T`, not part of the language any more; parsed to give a helpful error.
+  // Func: `func(T...) R`; inner is R (null if none).
+  // Array: `[len]T`.
+  enum Kind { Name, Ref, Slice, Optional, Result, Map, Ptr, Mut, Func, Array } kind = Name; // Result: `!T`, or `!` (inner null)
+  int64_t len = 0; // Array
   std::string name;  // Name
   std::string pkg;   // Name: the import name in `pkg.Name`, if qualified
   bool mut = false;  // Ref
   std::unique_ptr<TypeExpr> inner; // for Map: the value type
   std::unique_ptr<TypeExpr> key;   // Map
+  std::vector<std::unique_ptr<TypeExpr>> params; // Func
   SourceLoc loc;
 };
 using TypeExprPtr = std::unique_ptr<TypeExpr>;
 
 // A local variable or parameter, created by semantic analysis.
+// Variables of reference type (parameters passed without copying, loop
+// elements, switch bindings) are not visible as references: sema reads them
+// through an implicit dereference, so they look like plain values.
 struct LocalVar {
   std::string name;
   Type *type = nullptr;
   SourceLoc loc;
+  std::string readOnlyWhy; // for references: why it can't be changed, and what to do instead
 };
 
 // ----- Expressions -----
 
 enum class ExprKind {
   IntLit, FloatLit, StrLit, BoolLit, NoneLit, NilLit, Ident, Unary, Binary, Call, Field, Index, StructLit, SliceLit, EnumLit,
-  MapLit
+  MapLit, FuncRef
 };
 
 enum class UnOp {
   Neg,
   Not,
+  BitNot, // `^x` (or `~x`): flips every bit
   Deref,
   Ref,
   RefMut,
@@ -47,13 +58,17 @@ enum class UnOp {
   ReborrowShared,
   ReborrowMut,
   Try, // `try x`: unwrap, or return the error / none to the caller
+  // Inserted by sema: a copy of a place, for looping over (or switching on)
+  // a value that the body changes.
+  Copy,
 };
 
 // OrElse is `opt or default`.
-enum class BinOp { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, Gt, Ge, And, Or, OrElse };
+// BitAnd..Shr are bitwise: & | ^ &^ << >>
+enum class BinOp { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, Gt, Ge, And, Or, OrElse, BitAnd, BitOr, BitXor, AndNot, Shl, Shr };
 
 // Convert: a numeric conversion like int32(x); the target is the call's type.
-enum class Builtin { None, Print, Println, Len, Append, Clone, Convert, ToStr, Panic, MakeError, Delete, CStr };
+enum class Builtin { None, Print, Println, Len, Append, Clone, Convert, ToStr, Panic, MakeError, Delete, CStr, SizeOf };
 
 struct Expr {
   ExprKind kind;
@@ -91,9 +106,15 @@ struct IdentExpr : Expr {
   LocalVar *var = nullptr;
   IdentExpr(SourceLoc l, std::string n) : Expr(ExprKind::Ident, l), name(std::move(n)) {}
 };
+// A function used as a value (a function pointer); made by sema from a name.
+struct FuncRefExpr : Expr {
+  FuncInfo *func;
+  FuncRefExpr(SourceLoc l, FuncInfo *f) : Expr(ExprKind::FuncRef, l), func(f) {}
+};
 struct UnaryExpr : Expr {
   UnOp op;
   ExprPtr operand;
+  bool implicit = false; // inserted by sema (not written by the user)
   UnaryExpr(SourceLoc l, UnOp o, ExprPtr e) : Expr(ExprKind::Unary, l), op(o), operand(std::move(e)) {}
 };
 struct BinaryExpr : Expr {
@@ -111,6 +132,7 @@ struct CallExpr : Expr {
   FuncInfo *func = nullptr;
   Builtin builtin = Builtin::None;
   bool receiverLast = false; // evaluate args[0] after the others (two-phase borrow)
+  bool indirect = false;     // calls a function pointer: the callee is a value of a `func(...)` type
   CallExpr(SourceLoc l, ExprPtr c) : Expr(ExprKind::Call, l), callee(std::move(c)) {}
 };
 struct FieldExpr : Expr {
@@ -127,6 +149,7 @@ struct IndexExpr : Expr {
   // On maps: `m[k]` read gives an optional (MapRead); as an assignment
   // target it is the entry itself, inserted if missing (MapWrite).
   enum Mode { Slice, MapRead, MapWrite } mode = Slice;
+  bool ownedRead = false; // MapRead giving `?V` with a copy of the value, not `?&V`
   bool writeTarget = false; // set before checking: this is on the left of `=`
   IndexExpr(SourceLoc l, ExprPtr b, ExprPtr i)
       : Expr(ExprKind::Index, l), base(std::move(b)), index(std::move(i)) {}
@@ -152,6 +175,7 @@ struct MapLitExpr : Expr {
 struct SliceLitExpr : Expr {
   TypeExprPtr elemType;
   std::vector<ExprPtr> elems;
+  int64_t arrayLen = -1; // `[N]T{...}`: an array of N elements (the rest are zero); -1 for a slice
   SliceLitExpr(SourceLoc l, TypeExprPtr t) : Expr(ExprKind::SliceLit, l), elemType(std::move(t)) {}
 };
 
@@ -178,6 +202,7 @@ using StmtPtr = std::unique_ptr<Stmt>;
 struct BlockStmt : Stmt {
   std::vector<StmtPtr> stmts;
   SourceLoc endLoc;
+  bool isUnsafe = false; // `unsafe { ... }`: C pointers can be used directly
   explicit BlockStmt(SourceLoc l) : Stmt(StmtKind::Block, l) {}
 };
 struct VarDeclStmt : Stmt {
@@ -191,7 +216,7 @@ struct ExprStmt : Stmt {
   ExprPtr expr;
   ExprStmt(SourceLoc l, ExprPtr e) : Stmt(StmtKind::Expr, l), expr(std::move(e)) {}
 };
-enum class AssignOp { Set, Add, Sub, Mul, Div, Rem };
+enum class AssignOp { Set, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, AndNot, Shl, Shr };
 struct AssignStmt : Stmt {
   ExprPtr lhs;
   AssignOp op;

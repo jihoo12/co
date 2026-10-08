@@ -6,7 +6,7 @@ type Config struct {
     debug bool
 }
 
-func parsePort(text &string) !int {
+func parsePort(text string) !int {
     switch text {
     case "80":   return 80
     case "8080": return 8080
@@ -14,12 +14,12 @@ func parsePort(text &string) !int {
     return error("not a port: " + text)
 }
 
-func load(name &string, port &string) !Config {
+func load(name string, port string) !Config {
     if len(name) == 0 {
         return error("config needs a name")
     }
     p := try parsePort(port)       // on error, return it from load()
-    return Config{name: clone(name), port: p}
+    return Config{name: name, port: p}
 }
 
 func main() ! {

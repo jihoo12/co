@@ -1,8 +1,0 @@
-// error: cannot assign to '*r' because it is borrowed
-func main() {
-    a := 1
-    r := &mut a
-    s := &*r
-    *r = 2
-    println(*s)
-}

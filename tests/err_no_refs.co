@@ -1,0 +1,9 @@
+// error: co has no reference types
+// error: '&' gives C the address of a variable
+// error: 'mut' can only be used on a parameter
+func f(s &string) {}
+func main() {
+    x := 1
+    y := &x
+    var z mut int
+}

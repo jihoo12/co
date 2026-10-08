@@ -3,6 +3,6 @@
 
 namespace co {
 
-mir::Module buildMir(Program &prog, TypeContext &tc, Diagnostics &diag);
+mir::Module buildMir(Program &prog, TypeContext &tc);
 
 } // namespace co

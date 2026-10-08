@@ -7,14 +7,14 @@
 // expect: saved
 // expect: none
 type User struct { name string; age int }
-func parseAge(s &string) !int {
+func parseAge(s string) !int {
     if len(s) == 0 {
         return error("age is empty")
     }
     if s == "thirty" { return 30 }
     return 42
 }
-func load(name &string, age &string) !User {
+func load(name string, age string) !User {
     a := parseAge(age) or -1
     if a < 0 {
         return error("reading user: age is empty")
@@ -22,15 +22,15 @@ func load(name &string, age &string) !User {
     n := try parseAge(age)        // passes the error on (not reached when empty)
     return User{name: clone(name), age: n}
 }
-func save(u &User) ! {
+func save(u User) ! {
     if len(u.name) == 0 { return error("no name") }
     println("saved")
 }
-func firstChar(s &string) ?int {
+func firstChar(s string) ?int {
     n := try lookup(s)            // try on an optional returns none
     return n
 }
-func lookup(s &string) ?int {
+func lookup(s string) ?int {
     if s == "a" { return 97 }
     return none
 }

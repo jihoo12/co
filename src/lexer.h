@@ -39,6 +39,7 @@ enum class Tok {
   KwImport,
   KwExtern,
   KwNil,
+  KwUnsafe,
   // punctuation
   LParen,
   RParen,
@@ -77,6 +78,19 @@ enum class Tok {
   PercentAssign,
   PlusPlus,
   MinusMinus,
+  // bitwise
+  Pipe,   // |
+  Caret,  // ^
+  Tilde,  // ~
+  Shl,    // <<
+  Shr,    // >>
+  AndNot, // &^
+  AmpAssign,
+  PipeAssign,
+  CaretAssign,
+  ShlAssign,
+  ShrAssign,
+  AndNotAssign,
 };
 
 const char *tokName(Tok t);

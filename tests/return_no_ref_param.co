@@ -1,6 +1,0 @@
-// error: function returns a reference but has no reference parameters
-func bad() &int {
-    x := 1
-    return &x
-}
-func main() {}

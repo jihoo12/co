@@ -1,0 +1,27 @@
+// Addresses can be read as numbers; inside `unsafe`, numbers can become
+// pointers again (for memory-mapped hardware, or tagged pointers).
+extern {
+    func malloc(n uint64) *void
+    func free(p *void)
+}
+type Reg struct { ctrl, data uint32 }
+
+func main() {
+    unsafe {
+        p := (*Reg)(malloc(uint64(sizeof(Reg))))
+        p.ctrl = 0x1
+        p.data = 0xBEEF
+        addr := uint64(p)
+        r := (*Reg)(addr)                  // the same memory again
+        d := (*uint32)(addr + 4)           // the second field, by address
+        println(r.ctrl, *d == 0xBEEF, addr % 4)
+        bytes := (*uint8)(p)
+        println(bytes[4], bytes[5])        // little-endian 0xBEEF
+        var empty *Reg = (*Reg)(nil)
+        println(empty == nil, uint64(empty))
+        free(p)
+    }
+}
+// expect: 1 true 0
+// expect: 239 190
+// expect: true 0

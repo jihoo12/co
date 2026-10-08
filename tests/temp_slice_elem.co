@@ -1,6 +1,0 @@
-// error: temporary value dropped while still borrowed
-func nums() []int { return []int{1} }
-func main() {
-    r := &nums()[0]
-    println(*r)
-}

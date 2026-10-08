@@ -1,8 +1,0 @@
-// error: use of moved value 'x'
-func main() {
-    a := 1
-    x := &mut a
-    y := x
-    *x = 2
-    *y = 3
-}

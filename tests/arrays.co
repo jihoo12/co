@@ -1,0 +1,67 @@
+// Fixed-size arrays are values stored inline, laid out like C arrays.
+extern {
+    func memset(p *void, c int32, n uint64) *void
+    func snprintf(buf *byte, n uint64, fmt *byte, ...) int32
+    func strlen(s *byte) uint64
+}
+
+type Header struct {
+    magic [4]uint8
+    size uint32
+    name [8]byte
+}
+
+type Board struct { cells [3][3]int; names [2]string }
+
+func sum(a [5]int) int {
+    t := 0
+    for _, x := range a { t += x }
+    return t
+}
+func fill(a mut [5]int, v int) {
+    for i := range len(a) { a[i] = v }
+}
+
+func main() {
+    a := [5]int{1, 2, 3}
+    println(a, len(a), sum(a))
+    b := a
+    b[0] = 100
+    println(a[0], b[0])
+    fill(a, 7)
+    println(a)
+    var z [3]float
+    println(z)
+
+    var h Header
+    h.magic = [4]uint8{0x7f, 69, 76, 70}
+    h.size = 64
+    snprintf(h.name, 8, "%s", "elf")
+    println(h.magic, sizeof(Header), strlen(h.name))
+
+    var bd Board
+    bd.cells[1][2] = 5
+    bd.names[0] = "x"
+    bd.names[1] = "y" + "z"
+    c := bd
+    c.names[0] = "changed"
+    println(bd, c.names)
+
+    var buf [16]byte
+    memset(buf, 65, 3)
+    println(buf[0], buf[3])
+
+    words := [3]string{"a", "b"}
+    for i, w := range words {
+        words[i] = w + "!"
+    }
+    println(words)
+}
+// expect: [1, 2, 3, 0, 0] 5 6
+// expect: 1 100
+// expect: [7, 7, 7, 7, 7]
+// expect: [0, 0, 0]
+// expect: [127, 69, 76, 70] 16 3
+// expect: Board{cells: [[0, 0, 0], [0, 0, 5], [0, 0, 0]], names: [x, yz]} [changed, yz]
+// expect: 65 0
+// expect: [a!, b!, !]

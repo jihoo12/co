@@ -183,6 +183,39 @@ private:
       t->inner = parseType();
       return t;
     }
+    if (accept(Tok::KwFunc)) {
+      // func(T, ...) R; parameters may be named for documentation: func(a, b *void) int32
+      t->kind = TypeExpr::Func;
+      expect(Tok::LParen, "after 'func' in a function type");
+      size_t bare = 0; // trailing single identifiers: types, unless a named parameter follows
+      while (!at(Tok::RParen)) {
+        if (at(Tok::Ident) && peekTok(1).kind != Tok::Comma && peekTok(1).kind != Tok::RParen &&
+            peekTok(1).kind != Tok::Dot) {
+          next(); // a parameter name; earlier bare identifiers were names of the same type
+          auto ty = parseType();
+          t->params.resize(t->params.size() - bare);
+          for (size_t i = 0; i < bare; i++)
+            t->params.push_back(cloneType(*ty));
+          bare = 0;
+          t->params.push_back(std::move(ty));
+        } else {
+          bare = at(Tok::Ident) && peekTok(1).kind != Tok::Dot ? bare + 1 : 0;
+          t->params.push_back(parseType());
+        }
+        if (!accept(Tok::Comma))
+          break;
+      }
+      expect(Tok::RParen, "after the parameters of a function type");
+      if (at(Tok::Ident) || at(Tok::Star) || at(Tok::Question) || at(Tok::LBracket) || at(Tok::Not) ||
+          at(Tok::KwMap) || at(Tok::KwFunc))
+        t->inner = parseType();
+      return t;
+    }
+    if (accept(Tok::KwMut)) {
+      t->kind = TypeExpr::Mut;
+      t->inner = parseType();
+      return t;
+    }
     if (accept(Tok::Star)) {
       t->kind = TypeExpr::Ptr;
       t->inner = parseType();
@@ -208,8 +241,12 @@ private:
       return t;
     }
     if (accept(Tok::LBracket)) {
-      expect(Tok::RBracket, "in slice type");
       t->kind = TypeExpr::Slice;
+      if (at(Tok::Int)) { // [N]T
+        t->kind = TypeExpr::Array;
+        t->len = next().intVal;
+      }
+      expect(Tok::RBracket, t->kind == TypeExpr::Array ? "after the array length" : "in slice type");
       t->inner = parseType();
       return t;
     }
@@ -336,11 +373,14 @@ private:
     c->name = t.name;
     c->pkg = t.pkg;
     c->mut = t.mut;
+    c->len = t.len;
     c->loc = t.loc;
     if (t.inner)
       c->inner = cloneType(*t.inner);
     if (t.key)
       c->key = cloneType(*t.key);
+    for (auto &p : t.params)
+      c->params.push_back(cloneType(*p));
     return c;
   }
 
@@ -466,6 +506,12 @@ private:
     case Tok::KwContinue:
       next();
       return std::make_unique<BranchStmt>(StmtKind::Continue, l);
+    case Tok::KwUnsafe: {
+      next();
+      auto b = parseBlock();
+      b->isUnsafe = true;
+      return b;
+    }
     case Tok::KwIf:
       return parseIf();
     case Tok::KwFor:
@@ -498,6 +544,12 @@ private:
     case Tok::StarAssign: op = AssignOp::Mul; break;
     case Tok::SlashAssign: op = AssignOp::Div; break;
     case Tok::PercentAssign: op = AssignOp::Rem; break;
+    case Tok::AmpAssign: op = AssignOp::BitAnd; break;
+    case Tok::PipeAssign: op = AssignOp::BitOr; break;
+    case Tok::CaretAssign: op = AssignOp::BitXor; break;
+    case Tok::AndNotAssign: op = AssignOp::AndNot; break;
+    case Tok::ShlAssign: op = AssignOp::Shl; break;
+    case Tok::ShrAssign: op = AssignOp::Shr; break;
     case Tok::PlusPlus:
       next();
       return std::make_unique<IncDecStmt>(l, std::move(e), true);
@@ -623,8 +675,9 @@ private:
     case Tok::OrOr: return 2;
     case Tok::AndAnd: return 3;
     case Tok::Eq: case Tok::Ne: case Tok::Lt: case Tok::Le: case Tok::Gt: case Tok::Ge: return 4;
-    case Tok::Plus: case Tok::Minus: return 5;
-    case Tok::Star: case Tok::Slash: case Tok::Percent: return 6;
+    case Tok::Plus: case Tok::Minus: case Tok::Pipe: case Tok::Caret: return 5;
+    case Tok::Star: case Tok::Slash: case Tok::Percent: case Tok::Amp: case Tok::AndNot: case Tok::Shl: case Tok::Shr:
+      return 6;
     default: return 0;
     }
   }
@@ -643,6 +696,12 @@ private:
     case Tok::Minus: return BinOp::Sub;
     case Tok::Star: return BinOp::Mul;
     case Tok::Slash: return BinOp::Div;
+    case Tok::Amp: return BinOp::BitAnd;
+    case Tok::Pipe: return BinOp::BitOr;
+    case Tok::Caret: return BinOp::BitXor;
+    case Tok::AndNot: return BinOp::AndNot;
+    case Tok::Shl: return BinOp::Shl;
+    case Tok::Shr: return BinOp::Shr;
     default: return BinOp::Rem;
     }
   }
@@ -666,6 +725,8 @@ private:
       return std::make_unique<UnaryExpr>(l, UnOp::Neg, parseUnary());
     if (accept(Tok::Not))
       return std::make_unique<UnaryExpr>(l, UnOp::Not, parseUnary());
+    if (accept(Tok::Caret) || accept(Tok::Tilde))
+      return std::make_unique<UnaryExpr>(l, UnOp::BitNot, parseUnary());
     if (accept(Tok::KwTry))
       return std::make_unique<UnaryExpr>(l, UnOp::Try, parseUnary());
     if (accept(Tok::Star))
@@ -776,8 +837,12 @@ private:
     }
     case Tok::LBracket: {
       next();
-      expect(Tok::RBracket, "in slice literal");
+      int64_t arrayLen = -1;
+      if (at(Tok::Int))
+        arrayLen = next().intVal;
+      expect(Tok::RBracket, arrayLen >= 0 ? "after the array length" : "in slice literal");
       auto sl = std::make_unique<SliceLitExpr>(l, parseType());
+      sl->arrayLen = arrayLen;
       expect(Tok::LBrace, "to start slice literal");
       skipSemis();
       while (!at(Tok::RBrace)) {

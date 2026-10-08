@@ -1,0 +1,53 @@
+// Changing what a loop or switch looks at is fine: the loop goes over the
+// value as it was when the loop started (the compiler copies it only then).
+type Shape enum { Label(text string), Empty }
+type Bag struct { items []string }
+func (b mut Bag) add(s string) { b.items = append(b.items, s) }
+
+func main() {
+    v := []int{1, 2}
+    for _, x := range v {
+        v = append(v, x * 10)
+    }
+    println(v)
+
+    m := map[string]int{"a": 1}
+    for k, n := range m {
+        m[k + "2"] = n + 1
+    }
+    println(m)
+
+    s := Label("x")
+    switch s {
+    case Label(t):
+        s = Empty
+        println(t, s)
+    case Empty:
+    }
+
+    b := Bag{items: []string{"p"}}
+    for _, it := range b.items {
+        b.add(it + "!")
+    }
+    println(b.items)
+
+    s2 := Label("y")
+    switch s2 {
+    case Label(t):
+        kept := []Shape{s2}          // handing on what the switch looks at copies it
+        println(t, kept)
+    case Empty:
+    }
+
+    w := []string{"a", "b"}
+    for i, x := range w {        // only reads: no copy needed
+        println(i, x)
+    }
+}
+// expect: [1, 2, 10, 20]
+// expect: {a: 1, a2: 2}
+// expect: x Empty
+// expect: [p, p!]
+// expect: y [Label(y)]
+// expect: 0 a
+// expect: 1 b

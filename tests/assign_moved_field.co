@@ -1,8 +1,0 @@
-// error: cannot assign to part of moved value 'p'
-type P struct { name string; n int }
-func take(p P) {}
-func main() {
-    p := P{name: "a"}
-    take(p)
-    p.n = 1
-}

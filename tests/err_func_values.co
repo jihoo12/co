@@ -1,0 +1,17 @@
+// error: function 'greet' can't be used as a value: its parameter 's' is 'string'
+// error: function 'bump' can't be used as a value: its parameter 'n' is 'mut int'
+// error: function types can only take numbers, bool, pointers and functions
+// error: this function takes 1 argument, but 2 were given
+// error: 'x' is a variable, not a function
+func greet(s string) {}
+func bump(n mut int) {}
+func one(x int) int { return x }
+func main() {
+    g := greet
+    b := bump
+    var h func(string)
+    f := one
+    f(1, 2)
+    x := 1
+    (x)(2)
+}

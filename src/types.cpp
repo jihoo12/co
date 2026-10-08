@@ -19,6 +19,7 @@ bool Type::isCopy() const {
   case TypeKind::Float32:
   case TypeKind::Ptr:
   case TypeKind::Nil:
+  case TypeKind::Func:
     return true;
   case TypeKind::Ref:
     return !mut; // shared references can be freely copied; &mut is unique
@@ -27,6 +28,8 @@ bool Type::isCopy() const {
   case TypeKind::Slice:
   case TypeKind::Map:
     return false;
+  case TypeKind::Array:
+    return inner->isCopy();
   case TypeKind::Struct:
     // Structs cannot hold references, so "copy" is exactly "owns nothing".
     return !st->needsDrop;
@@ -48,7 +51,10 @@ bool Type::isCCompatible() const {
   case TypeKind::IntN:
   case TypeKind::Float32:
   case TypeKind::Ptr:
+  case TypeKind::Func:
     return true;
+  case TypeKind::Array:
+    return inner->isCCompatible();
   case TypeKind::Struct:
     for (auto &f : st->fields)
       if (!f.type->isCCompatible())
@@ -65,7 +71,8 @@ bool Type::isResult() const { return kind == TypeKind::Enum && en->resultOf; }
 bool Type::containsRef() const {
   switch (kind) {
   case TypeKind::Ref: return true;
-  case TypeKind::Slice: return inner->containsRef();
+  case TypeKind::Slice:
+  case TypeKind::Array: return inner->containsRef();
   case TypeKind::Map: return inner->containsRef();
   case TypeKind::Enum: return en->valueType() && en->valueType()->containsRef();
   default: return false;
@@ -79,6 +86,8 @@ bool Type::needsDrop() const {
   case TypeKind::Slice:
   case TypeKind::Map:
     return true;
+  case TypeKind::Array:
+    return inner->needsDrop();
   case TypeKind::Struct:
     return st->needsDrop;
   case TypeKind::Enum:
@@ -105,8 +114,16 @@ std::string Type::str() const {
   case TypeKind::Float32: return "float32";
   case TypeKind::IntN: return (isUnsigned ? "uint" : "int") + std::to_string(bits);
   case TypeKind::Ptr: return "*" + inner->str();
-  case TypeKind::Ref: return (mut ? "&mut " : "&") + inner->str();
+  case TypeKind::Func: {
+    std::string s = "func(";
+    for (size_t i = 0; i < params.size(); i++)
+      s += (i ? ", " : "") + params[i]->str();
+    s += ")";
+    return inner->kind == TypeKind::Void ? s : s + " " + inner->str();
+  }
+  case TypeKind::Ref: return (mut ? "mut " : "") + inner->str(); // references look like values in co
   case TypeKind::Slice: return "[]" + inner->str();
+  case TypeKind::Array: return "[" + std::to_string(len) + "]" + inner->str();
   case TypeKind::Map: return "map[" + key->str() + "]" + inner->str();
   }
   return "?";
@@ -207,6 +224,28 @@ Type *TypeContext::ref(Type *inner, bool mut) {
     slot->kind = TypeKind::Ref;
     slot->mut = mut;
     slot->inner = inner;
+  }
+  return slot.get();
+}
+
+Type *TypeContext::func(const std::vector<Type *> &params, Type *ret) {
+  auto &slot = funcs_[{params, ret}];
+  if (!slot) {
+    slot = std::make_unique<Type>();
+    slot->kind = TypeKind::Func;
+    slot->params = params;
+    slot->inner = ret;
+  }
+  return slot.get();
+}
+
+Type *TypeContext::array(Type *elem, int64_t len) {
+  auto &slot = arrays_[{elem, len}];
+  if (!slot) {
+    slot = std::make_unique<Type>();
+    slot->kind = TypeKind::Array;
+    slot->inner = elem;
+    slot->len = len;
   }
   return slot.get();
 }

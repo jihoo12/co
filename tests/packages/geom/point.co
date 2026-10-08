@@ -9,11 +9,11 @@ func New(x, y int, label string) Point {
     return Point{X: x, Y: y, label: label}
 }
 
-func (p &Point) Label() string { return clone(p.label) }
+func (p Point) Label() string { return p.label }
 
-func (p &mut Point) Move(dx, dy int) {
+func (p mut Point) Move(dx, dy int) {
     p.X += dx
     p.Y += dy
 }
 
-func (p &Point) dist2() int { return square(p.X) + square(p.Y) }
+func (p Point) dist2() int { return square(p.X) + square(p.Y) }

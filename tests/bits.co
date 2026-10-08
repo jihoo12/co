@@ -1,0 +1,33 @@
+// Bitwise operators work like Go's; shifting by the width or more gives 0
+// (or -1 for negative signed values), never undefined behavior.
+func popcount(x uint64) int {
+    n := 0
+    for x != 0 {
+        x &= x - 1
+        n++
+    }
+    return n
+}
+
+func main() {
+    a := 0b1100
+    println(a & 10, a | 3, a ^ 5, a &^ 4, a << 2, a >> 2, ^a, ~a)
+    var b uint8 = 0xF0
+    println(b >> 4, b << 1, ^b)
+    var s int8 = -16
+    println(s >> 2, s >> 100, 1 << 70, uint32(1) << 31)
+    x := 5
+    x <<= 3
+    x |= 1
+    x ^= 0xff
+    x &^= 0b110
+    x >>= 1
+    println(x, popcount(0xffff_ffff), 0o17, 1_000_000)
+    n := uint8(4)
+    println(1 << n, 0x1, 3 >> n)
+}
+// expect: 8 15 9 8 48 3 -13 -13
+// expect: 15 224 15
+// expect: -4 -1 0 2147483648
+// expect: 104 32 15 1000000
+// expect: 16 1 0

@@ -14,7 +14,7 @@ type User struct {
     email ?string
 }
 
-func area(s &Shape) float {
+func area(s Shape) float {
     switch s {
     case Circle(r):
         return 3.14159 * r * r
@@ -25,7 +25,7 @@ func area(s &Shape) float {
     }
 }
 
-func find(users &[]User, name &string) ?int {
+func find(users []User, name string) ?int {
     for i, u := range users {
         if u.name == name {
             return i            // wrapped as some(i) automatically
@@ -68,7 +68,7 @@ func main() {
         println(u.name, "->", u.email or "(no email)")
     }
 
-    idx := find(users, "bob")       // users and "bob" are borrowed automatically
+    idx := find(users, "bob")       // passed without copying
     println("bob at", idx or -1, "zoe at", find(users, "zoe") or -1)
     if find(users, "zoe") == none {
         println("no zoe")

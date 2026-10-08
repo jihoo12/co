@@ -1,0 +1,9 @@
+// error: making a pointer from a number can only be done inside 'unsafe { ... }'
+// error: cannot convert 'string' to '*uint8'
+func main() {
+    p := (*uint32)(0x1000)
+    s := "x"
+    unsafe {
+        q := (*uint8)(s)
+    }
+}

@@ -1,8 +1,0 @@
-// error: cannot assign to 'u.nick' because it is borrowed
-type User struct { nick ?string }
-func main() {
-    u := User{nick: "n"}
-    n := u.nick or "anon"
-    u.nick = none
-    println(n)
-}

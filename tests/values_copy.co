@@ -1,0 +1,54 @@
+// Values are never "used up": handing one on moves it when the variable
+// isn't used again, and copies it otherwise.
+type P struct { name string; n int; tags []string }
+
+func take(p P) int { return p.n }
+func keep(s string) string { return s + "!" }
+func count(list []string) int { return len(list) }
+
+func main() {
+    p := P{name: "a"}
+    take(p)
+    p.n = 1                      // p is still ours
+    println(p)
+
+    s := "hello"
+    for i := range 3 {
+        keep(s)                  // copied each time round
+    }
+    if len(s) > 2 { keep(s) }
+    println(s)
+
+    v := []string{"a", "b"}
+    first := v[0]                // a copy of the element
+    v[0] = "z"
+    println(first, v)
+
+    names := []string{"x"}
+    n := count(names)
+    println(names, n)
+
+    m := map[int]string{1: "one"}
+    one := m[1] or "none"        // a copy: m can change afterwards
+    m[2] = "two"
+    println(one, len(m))
+
+    a := []int{1, 2}
+    b := a                       // slices are values too
+    b[0] = 9
+    println(a, b)
+
+    q := p
+    q.tags = append(q.tags, "t")
+    println(len(p.tags), len(q.tags))
+    last := q                    // q isn't used again: moved, not copied
+    println(last.tags)
+}
+// expect: P{name: a, n: 1, tags: []}
+// expect: hello
+// expect: a [z, b]
+// expect: [x] 1
+// expect: one 2
+// expect: [1, 2] [9, 2]
+// expect: 0 1
+// expect: [t]

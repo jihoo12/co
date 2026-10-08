@@ -1,0 +1,24 @@
+// error: reading or writing through a C pointer can only be done inside 'unsafe { ... }'
+// error: indexing a C pointer can only be done inside 'unsafe { ... }'
+// error: '*void' points to nothing in particular
+// error: 'string' values can't be used through a pointer
+// error: '&' gives C the address of a variable
+// error: bitwise operators need integers, found 'float'
+// error: the shift count must be an integer
+// error: sizeof is for types C can use
+func main() {
+    var p *int32
+    x := *p
+    y := p[1]
+    var v *void
+    unsafe {
+        z := *v
+        var s *string
+        t := *s
+    }
+    a := 1
+    b := &a
+    c := 1.5 & 2.0
+    d := 1 << 2.0
+    e := sizeof(string)
+}

@@ -12,7 +12,7 @@ type Pixel struct {
     r, g, b uint8
 }
 
-func brighten(p &mut Pixel, by uint8) {
+func brighten(p mut Pixel, by uint8) {
     p.r += by
     p.g += by
 }
@@ -41,7 +41,7 @@ func main() {
 
     var half float = 3 / 2.0
     p := Pixel{r: 250, g: 1, b: 255}
-    brighten(&mut p, 2)
+    brighten(p, 2)
     println(half, p.g, p.b)
 
     var u uint8 = 200

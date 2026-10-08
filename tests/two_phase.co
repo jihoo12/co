@@ -1,11 +1,11 @@
 // expect: 4
 type Stack struct { items []int }
-func (s &mut Stack) push(x int) { s.items = append(s.items, x) }
-func (s &Stack) size() int { return len(s.items) }
+func (s mut Stack) push(x int) { s.items = append(s.items, x) }
+func (s Stack) size() int { return len(s.items) }
 func main() {
     s := Stack{}
     s.push(1)
-    s.push(s.size())   // arguments are evaluated before the &mut receiver borrow
+    s.push(s.size())   // arguments are read before the receiver is changed
     s.push(s.size())
     s.push(s.size())
     println(s.size())

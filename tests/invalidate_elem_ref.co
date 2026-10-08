@@ -1,7 +1,0 @@
-// error: cannot borrow 'v' as mutable because it is also borrowed as immutable
-func main() {
-    v := []int{1, 2, 3}
-    first := &v[0]
-    v = append(v, 4)      // may reallocate: `first` would dangle
-    println(*first)
-}

@@ -1,9 +1,0 @@
-// error: 'local' does not live long enough
-func bad(p &int) &int {
-    local := *p + 1
-    return &local
-}
-func main() {
-    x := 1
-    println(*bad(&x))
-}

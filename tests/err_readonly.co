@@ -1,0 +1,16 @@
+// error: cannot assign to 's': 's' is the element itself, which stays in names; change it there (names[i] = ...)
+// error: cannot change 'w': 'w' is part of the value being switched on
+type P struct { x int; s string }
+type Box enum { Full(c P), Empty }
+func grow(p mut P) { p.x++ }
+func main() {
+    names := []string{"a"}
+    for _, s := range names {
+        s = "b"
+    }
+    b := Full(P{})
+    switch b {
+    case Full(w): grow(w)
+    case Empty:
+    }
+}

@@ -57,6 +57,7 @@ static std::string opStr(const Function &f, const Operand &o) {
     case Constant::Float: return std::to_string(o.c.f);
     case Constant::Bool: return o.c.b ? "true" : "false";
     case Constant::Zero: return "zeroed";
+    case Constant::Func: return "fn " + o.c.fn->symbol;
     }
   }
   return "?";
@@ -78,6 +79,12 @@ static const char *bopStr(BinOp op) {
   case BinOp::And: return "And";
   case BinOp::Or: return "Or";
   case BinOp::OrElse: return "OrElse";
+  case BinOp::BitAnd: return "BitAnd";
+  case BinOp::BitOr: return "BitOr";
+  case BinOp::BitXor: return "BitXor";
+  case BinOp::AndNot: return "AndNot";
+  case BinOp::Shl: return "Shl";
+  case BinOp::Shr: return "Shr";
   }
   return "?";
 }
@@ -134,7 +141,7 @@ void print(const Function &f, std::string &out) {
         switch (rv.kind) {
         case Rvalue::Use: out += opStr(f, rv.ops[0]); break;
         case Rvalue::BinaryOp: out += std::string(bopStr(rv.bop)) + "(" + ops() + ")"; break;
-        case Rvalue::UnaryOp: out += std::string(rv.uop == UnOp::Neg ? "Neg" : "Not") + "(" + ops() + ")"; break;
+        case Rvalue::UnaryOp: out += std::string(rv.uop == UnOp::Neg ? "Neg" : rv.uop == UnOp::BitNot ? "BitNot" : "Not") + "(" + ops() + ")"; break;
         case Rvalue::Ref: out += std::string(rv.mut ? "&mut " : "&") + placeStr(f, rv.place); break;
         case Rvalue::Discriminant: out += "discriminant(" + placeStr(f, rv.place) + ")"; break;
         case Rvalue::Aggregate:
@@ -144,7 +151,7 @@ void print(const Function &f, std::string &out) {
           out += " { " + ops() + " }";
           break;
         case Rvalue::SliceLit: out += rv.type->str() + " [" + ops() + "]"; break;
-        case Rvalue::Call: out += rv.func->symbol + "(" + ops() + ")"; break;
+        case Rvalue::Call: out += (rv.func ? rv.func->symbol : "call") + "(" + ops() + ")"; break;
         case Rvalue::Builtin:
           out += std::string(builtinStr(rv.builtin)) + "(" + ops() + ")";
           if (rv.builtin == BuiltinOp::StrLit)
@@ -156,6 +163,9 @@ void print(const Function &f, std::string &out) {
       case Statement::Drop: out += "drop(" + placeStr(f, s.place) + ")"; break;
       case Statement::StorageDead: out += "StorageDead(_" + std::to_string(s.local) + ")"; break;
       case Statement::Nop: out += "nop"; break;
+      case Statement::CheckDistinct:
+        out += "check_distinct(_" + std::to_string(s.local) + ", _" + std::to_string(s.local2) + ")";
+        break;
       }
       out += "\n";
     }

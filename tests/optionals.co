@@ -4,7 +4,7 @@
 // expect: ann
 // expect: found ann
 type User struct { name string; nick ?string }
-func indexOf(v &[]int, x int) ?int {
+func indexOf(v []int, x int) ?int {
     for i, y := range v {
         if y == x { return i }
     }

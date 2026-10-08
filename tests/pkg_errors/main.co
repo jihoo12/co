@@ -9,7 +9,7 @@
 // error: package 'lib' can only be used as 'lib.Name'
 import "lib"
 
-func (s &lib.Secret) Extra() int { return 1 }
+func (s lib.Secret) Extra() int { return 1 }
 
 func main() {
     println(lib.Public())

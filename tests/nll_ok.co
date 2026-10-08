@@ -1,12 +1,12 @@
 // expect: 3 2
-func push(v &mut []int, x int) {
-    *v = append(*v, x)
+func push(v mut []int, x int) {
+    v = append(v, x)
 }
 func main() {
     v := []int{1}
-    r := &v
-    n := len(r)          // last use of r: the borrow ends here
-    push(&mut v, 2)      // so this mutable borrow is fine
-    push(&mut v, 3)
-    println(len(&v), n+1)
+    r := v               // a copy
+    n := len(r)
+    push(v, 2)
+    push(v, 3)
+    println(len(v), n+1)
 }

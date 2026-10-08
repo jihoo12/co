@@ -11,7 +11,7 @@ const std::unordered_map<std::string, Builtin> kBuiltins = {
     {"print", Builtin::Print},   {"println", Builtin::Println}, {"len", Builtin::Len},
     {"append", Builtin::Append}, {"clone", Builtin::Clone},     {"str", Builtin::ToStr},
     {"panic", Builtin::Panic},   {"error", Builtin::MakeError}, {"delete", Builtin::Delete},
-    {"cstr", Builtin::CStr},
+    {"cstr", Builtin::CStr},     {"sizeof", Builtin::SizeOf},
     // Numeric conversions are calls of the type's name: int32(x), float(n), ...
     {"int", Builtin::Convert},    {"int8", Builtin::Convert},   {"int16", Builtin::Convert},
     {"int32", Builtin::Convert},  {"int64", Builtin::Convert},  {"uint8", Builtin::Convert},
@@ -56,6 +56,8 @@ std::string exprStr(const Expr *e) {
     return exprStr(static_cast<const IndexExpr *>(e)->base.get()) + "[..]";
   case ExprKind::Unary: {
     auto *u = static_cast<const UnaryExpr *>(e);
+    if (u->implicit)
+      return exprStr(u->operand.get());
     if (u->op == UnOp::Deref)
       return "*" + exprStr(u->operand.get());
     return "expression";
@@ -144,6 +146,11 @@ public:
     for (auto &fd : prog_.funcs)
       if (fd->info && !fd->isExtern) {
         enter(fd->loc);
+        decideParamModes(*fd);
+      }
+    for (auto &fd : prog_.funcs)
+      if (fd->info && !fd->isExtern) {
+        enter(fd->loc);
         checkFunc(*fd);
       }
   }
@@ -160,6 +167,30 @@ private:
   FuncDecl *fn_ = nullptr;
   std::vector<std::unordered_map<std::string, LocalVar *>> scopes_;
   int loopDepth_ = 0;
+  bool addrOk_ = false; // checking an argument of a C call: `&x` is allowed
+  int unsafeDepth_ = 0; // inside `unsafe { ... }`: C pointers can be used directly
+
+  // Using a C pointer directly needs an `unsafe` block.
+  bool requireUnsafe(SourceLoc l, const std::string &what) {
+    if (unsafeDepth_ > 0)
+      return true;
+    error(l, what + " can only be done inside 'unsafe { ... }': the compiler can't check that the pointer is valid");
+    return false;
+  }
+  // What a pointer can be used to read or change directly.
+  bool pointeeOk(Type *p, SourceLoc l) {
+    Type *t = p->inner;
+    if (t->kind == TypeKind::Void) {
+      error(l, "'*void' points to nothing in particular; convert it to a pointer to something first (var q *T = p)");
+      return false;
+    }
+    if (!t->isCCompatible()) {
+      error(l, "'" + t->str() + "' values can't be used through a pointer (only numbers, bool, pointers and structs "
+               "of those can)");
+      return false;
+    }
+    return true;
+  }
   int breakDepth_ = 0; // loops and switches
 
   void error(SourceLoc l, std::string msg) { diag_.error(l, std::move(msg)); }
@@ -286,15 +317,33 @@ private:
         return nullptr;
       return tc_.result(inner);
     }
-    case TypeExpr::Ref: {
-      Type *inner = resolveType(*t.inner);
-      if (!inner)
-        return nullptr;
-      if (inner->isRef()) {
-        error(t.loc, "references to references are not supported");
-        return nullptr;
+    case TypeExpr::Ref:
+      error(t.loc, "co has no reference types: values are passed to functions without copying already; "
+                   "write 'mut T' for a parameter the function may change");
+      return nullptr;
+    case TypeExpr::Mut:
+      error(t.loc, "'mut' can only be used on a parameter, like 'func reset(c mut Counter)'");
+      return nullptr;
+    case TypeExpr::Func: {
+      std::vector<Type *> params;
+      bool ok = true;
+      for (auto &p : t.params) {
+        Type *pt = resolveType(*p);
+        if (pt && !cScalar(pt)) {
+          error(p->loc, "function types can only take numbers, bool, pointers and functions (so C can call "
+                        "them too), not '" + pt->str() + "'");
+          pt = nullptr;
+        }
+        ok &= pt != nullptr;
+        params.push_back(pt);
       }
-      return tc_.ref(inner, t.mut);
+      Type *ret = t.inner ? resolveType(*t.inner) : tc_.voidTy();
+      if (ret && ret->kind != TypeKind::Void && !cScalar(ret)) {
+        error(t.inner->loc, "function types can only return numbers, bool, pointers and functions, not '" +
+                                ret->str() + "'");
+        ret = nullptr;
+      }
+      return ok && ret ? tc_.func(params, ret) : nullptr;
     }
     case TypeExpr::Ptr: {
       if (t.inner->kind == TypeExpr::Name && t.inner->name == "void" && t.inner->pkg.empty())
@@ -307,6 +356,16 @@ private:
         return nullptr;
       }
       return tc_.ptr(inner);
+    }
+    case TypeExpr::Array: {
+      Type *inner = resolveType(*t.inner);
+      if (!inner)
+        return nullptr;
+      if (t.len < 0 || t.len > (int64_t(1) << 32)) {
+        error(t.loc, "array length must be between 0 and 2^32");
+        return nullptr;
+      }
+      return tc_.array(inner, t.len);
     }
     case TypeExpr::Slice: {
       Type *inner = resolveType(*t.inner);
@@ -321,6 +380,9 @@ private:
     }
     return nullptr;
   }
+
+  // What C passes around in registers: numbers, bool, pointers, functions.
+  static bool cScalar(Type *t) { return t->isNumeric() || t->kind == TypeKind::Bool || t->isPtr() || t->isFunc(); }
 
   bool typeNameTaken(const std::string &n) {
     return pkg_->structs.count(n) || pkg_->enums.count(n) || tc_.numericByName(n) || n == "void" || n == "int" || n == "float" || n == "bool" ||
@@ -457,6 +519,7 @@ private:
       switch (t->kind) {
       case TypeKind::Struct: return visitStruct(t->st);
       case TypeKind::Enum: return t->en->valueType() ? visitType(t->en->valueType()) : visitEnum(t->en);
+      case TypeKind::Array: return visitType(t->inner); // stored inline
       default: return true; // slices and references add indirection
       }
     };
@@ -480,11 +543,10 @@ private:
       info->loc = fd->loc;
       info->decl = fd.get();
       bool ok = true;
-      int refParams = 0;
       if (fd->receiver) {
-        Type *rt = resolveType(*fd->receiver->type);
+        Type *rt = resolveParamType(*fd->receiver->type, false);
         if (rt && rt->derefAll()->kind != TypeKind::Struct) {
-          error(fd->receiver->loc, "method receiver must be a struct type T, &T or &mut T");
+          error(fd->receiver->loc, "method receiver must be a struct type T or mut T");
           rt = nullptr;
         }
         if (!rt) {
@@ -493,28 +555,20 @@ private:
           info->recvStruct = rt->derefAll()->st;
           info->params.push_back(rt);
           info->paramNames.push_back(fd->receiver->name);
-          refParams += rt->containsRef();
         }
       }
       for (auto &p : fd->params) {
-        Type *pt = resolveType(*p.type);
+        Type *pt = resolveParamType(*p.type, fd->isExtern);
         if (!pt)
           ok = false;
-        else
-          refParams += pt->containsRef();
         info->params.push_back(pt);
         info->paramNames.push_back(p.name);
       }
       info->ret = tc_.voidTy();
       if (fd->ret) {
         info->ret = resolveType(*fd->ret);
-        if (!info->ret) {
+        if (!info->ret)
           ok = false;
-        } else if (info->ret->containsRef() && refParams == 0) {
-          error(fd->ret->loc, "function returns a reference but has no reference parameters to borrow "
-                              "from; return an owned value instead");
-          ok = false;
-        }
       }
       if (!ok)
         continue;
@@ -570,6 +624,19 @@ private:
       error({1, 1}, "program has no 'func main()'");
   }
 
+  // A parameter's declared type. `mut T` becomes `&mut T`; the others stay
+  // values until decideParamModes picks how to pass them.
+  Type *resolveParamType(const TypeExpr &t, bool isExtern) {
+    if (t.kind != TypeExpr::Mut)
+      return resolveType(t);
+    if (isExtern) {
+      error(t.loc, "C functions can't take 'mut' parameters; take a pointer '*T' and pass '&x'");
+      return nullptr;
+    }
+    Type *inner = resolveType(*t.inner);
+    return inner ? tc_.ref(inner, true) : nullptr;
+  }
+
   // Checks that a package-level function name is free; with `info`, also claims it.
   bool declareFuncName(FuncDecl &fd, FuncInfo *info) {
     if (kBuiltins.count(fd.name)) {
@@ -585,6 +652,314 @@ private:
     return true;
   }
 
+  // ----- how parameters are passed -----
+  //
+  // A parameter `x T` acts like the caller's value, but copying it on every
+  // call would be wasteful. Copyable types (numbers, plain structs) are passed
+  // by value. Other types are lent (passed as a shared reference) unless the
+  // body changes the parameter or keeps it (returns it, stores it, ...): then
+  // the function gets a value of its own, which the caller moves in when it
+  // doesn't use it again, and copies otherwise. `x mut T` is a reference
+  // through which the function changes the caller's value.
+  // The scan below looks for changes to the variables in scanVars_ (with
+  // their types) and for places where they are kept as whole values.
+  std::unordered_map<std::string, Type *> scanVars_;
+  std::unordered_set<std::string> changed_, kept_;
+
+  void decideParamModes(FuncDecl &fd) {
+    FuncInfo *info = fd.info;
+    std::vector<Param *> ps;
+    if (fd.receiver)
+      ps.push_back(&*fd.receiver);
+    for (auto &p : fd.params)
+      ps.push_back(&p);
+    scanVars_.clear();
+    for (size_t i = 0; i < ps.size(); i++)
+      if (ps[i]->type->kind != TypeExpr::Mut && !info->params[i]->isCopy())
+        scanVars_[ps[i]->name] = info->params[i];
+    if (scanVars_.empty())
+      return;
+    changed_.clear();
+    kept_.clear();
+    scanStmt(*fd.body);
+    for (size_t i = 0; i < ps.size(); i++) {
+      const std::string &n = ps[i]->name;
+      if (scanVars_.count(n) && !changed_.count(n) && !kept_.count(n))
+        info->params[i] = tc_.ref(info->params[i], false);
+    }
+  }
+
+  // The scanned variable that place `e` (`p`, `p.items[i]`) is part of, if any.
+  const std::string *scanRoot(const Expr *e) {
+    for (;;) {
+      switch (e->kind) {
+      case ExprKind::Ident: {
+        auto &n = static_cast<const IdentExpr *>(e)->name;
+        return scanVars_.count(n) ? &n : nullptr;
+      }
+      case ExprKind::Field: e = static_cast<const FieldExpr *>(e)->base.get(); break;
+      case ExprKind::Index: e = static_cast<const IndexExpr *>(e)->base.get(); break;
+      default: return nullptr;
+      }
+    }
+  }
+  void scanChanges(const Expr *e) {
+    if (const std::string *n = scanRoot(e))
+      changed_.insert(*n);
+  }
+  // Only the variable itself: a field taken out of it is copied anyway.
+  void scanKeeps(const Expr *e) {
+    if (e->kind == ExprKind::Ident && scanVars_.count(static_cast<const IdentExpr *>(e)->name))
+      kept_.insert(static_cast<const IdentExpr *>(e)->name);
+  }
+
+  // The type of a place rooted at a parameter, as far as it can be told before checking.
+  Type *scanPlaceType(const Expr *e) {
+    switch (e->kind) {
+    case ExprKind::Ident: {
+      auto it = scanVars_.find(static_cast<const IdentExpr *>(e)->name);
+      return it == scanVars_.end() ? nullptr : it->second;
+    }
+    case ExprKind::Field: {
+      auto *fe = static_cast<const FieldExpr *>(e);
+      Type *bt = scanPlaceType(fe->base.get());
+      if (!bt || bt->derefAll()->kind != TypeKind::Struct)
+        return nullptr;
+      StructInfo *st = bt->derefAll()->st;
+      auto it = st->fieldIndex.find(fe->name);
+      return it == st->fieldIndex.end() ? nullptr : st->fields[it->second].type;
+    }
+    case ExprKind::Index: {
+      Type *bt = scanPlaceType(static_cast<const IndexExpr *>(e)->base.get());
+      if (!bt)
+        return nullptr;
+      bt = bt->derefAll();
+      return bt->kind == TypeKind::Slice || bt->kind == TypeKind::Array || bt->kind == TypeKind::Map ? bt->inner
+                                                                                                    : nullptr;
+    }
+    default:
+      return nullptr;
+    }
+  }
+
+  // The variable that (checked) place `e` is part of, if any.
+  static LocalVar *rootVar(const Expr *e) {
+    for (;;) {
+      switch (e->kind) {
+      case ExprKind::Ident: return static_cast<const IdentExpr *>(e)->var;
+      case ExprKind::Field: e = static_cast<const FieldExpr *>(e)->base.get(); break;
+      case ExprKind::Index: e = static_cast<const IndexExpr *>(e)->base.get(); break;
+      case ExprKind::Unary:
+        if (static_cast<const UnaryExpr *>(e)->op != UnOp::Deref)
+          return nullptr;
+        e = static_cast<const UnaryExpr *>(e)->operand.get();
+        break;
+      default: return nullptr;
+      }
+    }
+  }
+
+  // Looping over or switching on place `e` looks at it in place, unless the
+  // statements (not yet checked) change it: then they work on a copy, made
+  // here, so the loop sees the value as it was when it started.
+  void copyIfChanged(ExprPtr &e, const std::vector<const Stmt *> &body) {
+    LocalVar *v = isPlace(e.get()) ? rootVar(e.get()) : nullptr;
+    if (!v || e->type->isCopy())
+      return;
+    scanVars_ = {{v->name, v->type->derefAll()}};
+    changed_.clear();
+    kept_.clear();
+    for (const Stmt *st : body)
+      scanStmt(*st);
+    if (changed_.count(v->name)) {
+      Type *t = e->type;
+      e = wrap(std::move(e), UnOp::Copy, t);
+    }
+  }
+
+  static bool takesMut(const FuncInfo *f, size_t declParam) {
+    return f->decl && declParam < f->decl->params.size() && f->decl->params[declParam].type->kind == TypeExpr::Mut;
+  }
+
+  void scanCall(const CallExpr &c) {
+    const FuncInfo *f = nullptr;
+    if (c.callee->kind == ExprKind::Ident) {
+      const std::string &name = static_cast<const IdentExpr *>(c.callee.get())->name;
+      if (name == "delete" && !c.args.empty())
+        scanChanges(c.args[0].get());
+      if (name == "append" && c.args.size() == 2)
+        scanKeeps(c.args[1].get());
+      if (name == "some" || pkg_->variants.count(name))
+        for (auto &a : c.args)
+          scanKeeps(a.get());
+      auto it = pkg_->funcs.find(name);
+      if (it != pkg_->funcs.end())
+        f = it->second;
+    } else if (c.callee->kind == ExprKind::Field) {
+      auto *fe = static_cast<const FieldExpr *>(c.callee.get());
+      if (const Import *imp = importBase(fe->base.get())) {
+        if (imp->pkg) {
+          auto it = imp->pkg->funcs.find(fe->name);
+          if (it != imp->pkg->funcs.end())
+            f = it->second;
+          else if (imp->pkg->variants.count(fe->name))
+            for (auto &a : c.args)
+              scanKeeps(a.get());
+        }
+      } else if (Type *bt = scanPlaceType(fe->base.get())) {
+        // A method called on (part of) a parameter.
+        bt = bt->derefAll();
+        if (bt->kind == TypeKind::Struct) {
+          auto it = bt->st->methods.find(fe->name);
+          if (it != bt->st->methods.end()) {
+            FuncDecl *md = it->second->decl;
+            if (md->receiver && md->receiver->type->kind == TypeExpr::Mut)
+              scanChanges(fe->base.get());
+            for (size_t i = 0; i < c.args.size(); i++)
+              if (takesMut(it->second, i))
+                scanChanges(c.args[i].get());
+          }
+        }
+      }
+    }
+    if (f && !f->isExtern)
+      for (size_t i = 0; i < c.args.size(); i++)
+        if (takesMut(f, i))
+          scanChanges(c.args[i].get());
+  }
+
+  void scanExpr(const Expr *e) {
+    if (!e)
+      return;
+    switch (e->kind) {
+    case ExprKind::Unary: {
+      auto *u = static_cast<const UnaryExpr *>(e);
+      if (u->op == UnOp::RefMut) // `&mut p` handed to C
+        scanChanges(u->operand.get());
+      scanExpr(u->operand.get());
+      break;
+    }
+    case ExprKind::Binary:
+      scanExpr(static_cast<const BinaryExpr *>(e)->lhs.get());
+      scanExpr(static_cast<const BinaryExpr *>(e)->rhs.get());
+      break;
+    case ExprKind::Call: {
+      auto *c = static_cast<const CallExpr *>(e);
+      scanCall(*c);
+      scanExpr(c->callee.get());
+      for (auto &a : c->args)
+        scanExpr(a.get());
+      break;
+    }
+    case ExprKind::Field:
+      scanExpr(static_cast<const FieldExpr *>(e)->base.get());
+      break;
+    case ExprKind::Index:
+      scanExpr(static_cast<const IndexExpr *>(e)->base.get());
+      scanExpr(static_cast<const IndexExpr *>(e)->index.get());
+      break;
+    case ExprKind::StructLit:
+      for (auto &f : static_cast<const StructLitExpr *>(e)->fields) {
+        scanKeeps(f.value.get());
+        scanExpr(f.value.get());
+      }
+      break;
+    case ExprKind::SliceLit:
+      for (auto &el : static_cast<const SliceLitExpr *>(e)->elems) {
+        scanKeeps(el.get());
+        scanExpr(el.get());
+      }
+      break;
+    case ExprKind::MapLit:
+      for (auto &[k, v] : static_cast<const MapLitExpr *>(e)->entries) {
+        scanKeeps(v.get());
+        scanExpr(k.get());
+        scanExpr(v.get());
+      }
+      break;
+    default:
+      break;
+    }
+  }
+
+  void scanStmt(const Stmt &s) {
+    switch (s.kind) {
+    case StmtKind::Block:
+      for (auto &st : static_cast<const BlockStmt &>(s).stmts)
+        scanStmt(*st);
+      break;
+    case StmtKind::VarDecl: {
+      auto &vd = static_cast<const VarDeclStmt &>(s);
+      if (vd.init) {
+        scanKeeps(vd.init.get());
+        scanExpr(vd.init.get());
+      }
+      break;
+    }
+    case StmtKind::Expr:
+      scanExpr(static_cast<const ExprStmt &>(s).expr.get());
+      break;
+    case StmtKind::Assign: {
+      auto &as = static_cast<const AssignStmt &>(s);
+      scanChanges(as.lhs.get());
+      if (as.op == AssignOp::Set)
+        scanKeeps(as.rhs.get());
+      scanExpr(as.lhs.get());
+      scanExpr(as.rhs.get());
+      break;
+    }
+    case StmtKind::IncDec:
+      scanChanges(static_cast<const IncDecStmt &>(s).target.get());
+      break;
+    case StmtKind::If: {
+      auto &is = static_cast<const IfStmt &>(s);
+      scanExpr(is.cond.get());
+      scanStmt(*is.then);
+      if (is.els)
+        scanStmt(*is.els);
+      break;
+    }
+    case StmtKind::For: {
+      auto &fs = static_cast<const ForStmt &>(s);
+      if (fs.init)
+        scanStmt(*fs.init);
+      scanExpr(fs.cond.get());
+      if (fs.post)
+        scanStmt(*fs.post);
+      scanStmt(*fs.body);
+      break;
+    }
+    case StmtKind::ForRange: {
+      auto &fr = static_cast<const ForRangeStmt &>(s);
+      scanExpr(fr.range.get());
+      scanStmt(*fr.body);
+      break;
+    }
+    case StmtKind::Switch: {
+      auto &sw = static_cast<const SwitchStmt &>(s);
+      scanExpr(sw.tag.get());
+      for (auto &c : sw.cases) {
+        for (auto &v : c.values)
+          scanExpr(v.get());
+        for (auto &st : c.body)
+          scanStmt(*st);
+      }
+      break;
+    }
+    case StmtKind::Return: {
+      auto &rs = static_cast<const ReturnStmt &>(s);
+      if (rs.value) {
+        scanKeeps(rs.value.get());
+        scanExpr(rs.value.get());
+      }
+      break;
+    }
+    case StmtKind::Break:
+    case StmtKind::Continue:
+      break;
+    }
+  }
+
   // C functions take and return numbers, bool and pointers. Pointers may
   // point to those, to structs made only of those, or to anything (*void).
   bool checkExternSignature(FuncDecl &fd, FuncInfo &info) {
@@ -592,9 +967,7 @@ private:
       error(fd.loc, "an extern function cannot be called 'main'");
       return false;
     }
-    auto scalar = [](Type *t) {
-      return t->isNumeric() || t->kind == TypeKind::Bool || t->isPtr();
-    };
+    auto scalar = [](Type *t) { return cScalar(t); };
     auto pointee = [&](Type *t) {
       for (; t->isPtr(); t = t->inner)
         if (t->inner->kind != TypeKind::Void && !t->inner->isPtr() && !t->inner->isCCompatible())
@@ -659,12 +1032,19 @@ private:
     scopes_.emplace_back();
     FuncInfo *info = fd.info;
     size_t pi = 0;
+    auto readOnly = [&](LocalVar *v, Type *declared, bool recv) {
+      v->readOnlyWhy = std::string(recv ? "receiver" : "parameter") + " '" + v->name +
+                       "' is read-only; declare it as '" + (recv ? "(" : "") + v->name + " mut " + declared->str() +
+                       (recv ? ")" : "") + "' to change the caller's value, or copy it first ('y := " + v->name + "')";
+    };
     if (fd.receiver) {
       fd.receiver->var = newVar(fd.receiver->name, info->params[pi++], fd.receiver->loc);
+      readOnly(fd.receiver->var, fd.receiver->var->type->derefAll(), true);
       declare(fd.receiver->var);
     }
     for (auto &p : fd.params) {
       p.var = newVar(p.name, info->params[pi++], p.loc);
+      readOnly(p.var, p.var->type->derefAll(), false);
       declare(p.var);
     }
     checkBlock(*fd.body);
@@ -674,8 +1054,10 @@ private:
 
   void checkBlock(BlockStmt &b) {
     scopes_.emplace_back();
+    unsafeDepth_ += b.isUnsafe;
     for (auto &s : b.stmts)
       checkStmt(*s);
+    unsafeDepth_ -= b.isUnsafe;
     scopes_.pop_back();
   }
 
@@ -703,8 +1085,14 @@ private:
           error(vd.init->loc, "cannot tell the type of 'none' here; write 'var " + vd.name + " ?T = none'");
           ty = nullptr;
         }
-      } else if (ty && ty->isRef()) {
-        error(vd.loc, "reference variable '" + vd.name + "' must be initialized");
+        // A variable holds a value of its own, never a view into another one.
+        if (ty && ty->containsRef()) {
+          Type *own = ty->isRef() ? ty->inner
+                      : ty->isOptional() && ty->en->optionalOf->isRef() ? tc_.optional(ty->en->optionalOf->inner)
+                                                                       : nullptr;
+          if (own && coerce(vd.init, own))
+            ty = own;
+        }
       }
       vd.var = newVar(vd.name, ty, vd.loc);
       declare(vd.var);
@@ -778,6 +1166,8 @@ private:
     case StmtKind::ForRange: {
       auto &fr = static_cast<ForRangeStmt &>(s);
       Type *t = check(fr.range);
+      if (t && (t->kind == TypeKind::Slice || t->kind == TypeKind::Array || t->kind == TypeKind::Map))
+        copyIfChanged(fr.range, {fr.body.get()});
       Type *elemTy = nullptr;
       Type *keyTy = nullptr;
       if (t && t->derefAll()->kind == TypeKind::Map) {
@@ -788,23 +1178,28 @@ private:
         fr.valueByRef = !mt->inner->isCopy();
         elemTy = fr.valueByRef ? tc_.ref(mt->inner, false) : mt->inner;
         autoRefShared(fr.range);
-      } else if (t && t->derefAll()->kind == TypeKind::Slice) {
+      } else if (t && (t->derefAll()->kind == TypeKind::Slice || t->derefAll()->kind == TypeKind::Array)) {
         fr.overSlice = true;
         Type *et = t->derefAll()->inner;
         fr.valueByRef = !et->isCopy();
         elemTy = fr.valueByRef ? tc_.ref(et, false) : et;
         autoRefShared(fr.range); // iterating borrows the slice; it is not consumed
       } else if (t && t->kind != TypeKind::Int) {
-        error(fr.range->loc, "range expects an int (iterates 0..n-1) or a slice, found '" + t->str() + "'");
+        error(fr.range->loc, "range expects an int (iterates 0..n-1), a slice, an array or a map, found '" + t->str() + "'");
       } else if (t && !fr.valueName.empty()) {
         error(fr.valueLoc, "range over an int gives only one value: write 'for i := range n'");
       }
       scopes_.emplace_back();
       fr.var = newVar(fr.name, keyTy ? keyTy : tc_.intTy(), fr.nameLoc);
+      fr.var->readOnlyWhy = "map keys can't be changed; copy it first ('k := " + fr.name + "')";
       if (fr.name != "_")
         declare(fr.var);
       if (!fr.valueName.empty() && elemTy) {
         fr.valueVar = newVar(fr.valueName, elemTy, fr.valueLoc);
+        std::string r = exprStr(fr.range.get());
+        fr.valueVar->readOnlyWhy =
+            "'" + fr.valueName + "' is the element itself, which stays in " + r + "; change it there (" + r + "[" +
+            (fr.name == "_" ? "i" : fr.name) + "] = ...), or copy it first ('y := " + fr.valueName + "')";
         if (fr.valueName != "_")
           declare(fr.valueVar);
       }
@@ -947,6 +1342,11 @@ private:
     if (base->kind == TypeKind::Enum) {
       sw.mode = SwitchStmt::Enum;
       EnumInfo *en = base->en;
+      std::vector<const Stmt *> bodies;
+      for (auto &c : sw.cases)
+        for (auto &st : c.body)
+          bodies.push_back(st.get());
+      copyIfChanged(sw.tag, bodies);
       std::vector<bool> covered(en->variants.size(), false);
       for (auto &c : sw.cases) {
         scopes_.emplace_back();
@@ -975,6 +1375,8 @@ private:
               continue;
             }
             LocalVar *lv = newVar(binds[i].first, byRef ? tc_.ref(ft, false) : ft, binds[i].second);
+            lv->readOnlyWhy = "'" + lv->name + "' is part of the value being switched on; copy it first ('y := " +
+                              lv->name + "')";
             declare(lv);
             c.bindings.push_back(lv);
           }
@@ -1084,6 +1486,17 @@ private:
       error(as.loc, "compound assignment needs an int or float, found '" + lt->str() + "'");
       return;
     }
+    if (as.op >= AssignOp::BitAnd) {
+      if (!lt->isInteger()) {
+        error(as.loc, "bitwise assignment needs an integer, found '" + lt->str() + "'");
+        return;
+      }
+      if (as.op == AssignOp::Shl || as.op == AssignOp::Shr) {
+        if (!rt->isInteger())
+          error(as.rhs->loc, "the shift count must be an integer, found '" + rt->str() + "'");
+        return;
+      }
+    }
     if (as.op == AssignOp::Rem && !lt->isInteger()) {
       error(as.loc, "'%=' needs an integer");
       return;
@@ -1091,8 +1504,11 @@ private:
     coerce(as.rhs, lt);
   }
 
-  // Reports an error if `e` (a place) cannot be modified.
-  bool checkMutablePlace(const Expr *e, const char *action) {
+  // Reports an error if `e` (a place) cannot be modified. `whole` is the
+  // place named in the message (`p.x` when checking its base `p`).
+  bool checkMutablePlace(const Expr *e, const char *action, const Expr *whole = nullptr) {
+    if (!whole)
+      whole = e;
     switch (e->kind) {
     case ExprKind::Ident:
       return true;
@@ -1108,22 +1524,25 @@ private:
         autoDeref = static_cast<const IndexExpr *>(e)->autoDeref;
       }
       if (autoDeref) {
-        if (!base->type->mut) {
-          error(e->loc, std::string("cannot ") + action + " '" + exprStr(e) + "' because '" +
-                            exprStr(base) + "' is a shared reference '" + base->type->str() +
-                            "' (use '&mut' to allow changes)");
+        if (!base->type->isPtr() && !base->type->mut) {
+          error(whole->loc, std::string("cannot ") + action + " '" + exprStr(whole) + "': '" + exprStr(base) +
+                                "' is read-only here; copy it first");
           return false;
         }
         return true;
       }
-      return isPlace(base) ? checkMutablePlace(base, action) : true;
+      return isPlace(base) ? checkMutablePlace(base, action, whole) : true;
     }
     case ExprKind::Unary: {
       auto *u = static_cast<const UnaryExpr *>(e);
-      if (u->op == UnOp::Deref && !u->operand->type->mut) {
-        error(e->loc, std::string("cannot ") + action + " '" + exprStr(e) + "' because '" +
-                          exprStr(u->operand.get()) + "' is a shared reference '" +
-                          u->operand->type->str() + "'");
+      if (u->op == UnOp::Deref && !u->operand->type->isPtr() && !u->operand->type->mut) {
+        std::string why = "it is read-only here; copy it first";
+        if (u->operand->kind == ExprKind::Ident) {
+          LocalVar *v = static_cast<const IdentExpr *>(u->operand.get())->var;
+          if (v && !v->readOnlyWhy.empty())
+            why = v->readOnlyWhy;
+        }
+        error(whole->loc, std::string("cannot ") + action + " '" + exprStr(whole) + "': " + why);
         return false;
       }
       return true;
@@ -1139,6 +1558,7 @@ private:
     SourceLoc l = e->loc;
     auto u = std::make_unique<UnaryExpr>(l, op, std::move(e));
     u->type = ty;
+    u->implicit = true;
     return u;
   }
 
@@ -1161,11 +1581,19 @@ private:
   }
 
   // Implicit conversions at assignment/argument/return sites. Arguments
-  // (`isArg`) are also borrowed automatically when the parameter is `&T`.
+  // (`isArg`) are lent automatically to parameters passed by reference.
   bool coerce(ExprPtr &e, Type *target, bool isArg = false) {
     Type *t = e->type;
     if (!t || !target)
       return false;
+    // A map read kept as a value (`x := m[k]`) holds a copy of what it found.
+    if (e->kind == ExprKind::Index && t->isOptional() && t->en->optionalOf->isRef() && target->isOptional() &&
+        target->en->optionalOf == t->en->optionalOf->inner) {
+      auto *ie = static_cast<IndexExpr *>(e.get());
+      ie->ownedRead = true;
+      ie->type = target;
+      return true;
+    }
     if (target->isResult() && t != target) {
       int vi = 0;
       if (t->kind == TypeKind::Error) {
@@ -1196,17 +1624,19 @@ private:
       return true;
     }
     if (isArg && target->isRef() && !t->isRef() && target->inner == t) {
-      if (!target->mut) {
-        e = wrap(std::move(e), UnOp::Ref, target);
-        return true;
-      }
-      error(e->loc, "this function may change its argument, so pass it as '&mut " + exprStr(e.get()) +
-                        "' to allow that");
-      return false;
+      if (target->mut && isPlace(e.get()) && !checkMutablePlace(e.get(), "change"))
+        return false;
+      e = wrap(std::move(e), target->mut ? UnOp::RefMut : UnOp::Ref, target);
+      return true;
+    }
+    // Where a value is needed, a view of one gives a copy of it.
+    if (t->isRef() && target == t->inner) {
+      e = wrap(std::move(e), UnOp::Deref, target);
+      return true;
     }
     if (t != target && target->isNumeric() && isNumericLiteral(e.get()))
       return retypeLiteral(e, target);
-    if (t->kind == TypeKind::Nil && target->isPtr()) {
+    if (t->kind == TypeKind::Nil && (target->isPtr() || target->isFunc())) {
       e->type = target;
       return true;
     }
@@ -1234,12 +1664,6 @@ private:
       hint = " (the value may be missing: use 'x or default', or a switch with 'case some(v)')";
     else if (t->isResult() && t->en->resultOf == target)
       hint = " (this may be an error: use 'try x' to pass it on, 'x or default', or a switch with 'case ok(v)')";
-    else if (target->isRef() && !t->isRef() && target->inner == t)
-      hint = std::string(" (add '") + (target->mut ? "&mut" : "&") + "' to pass a reference)";
-    else if (t->isRef() && !target->isRef() && t->inner == target)
-      hint = target->isCopy() ? " (use '*' to dereference)" : " (use clone(x) to copy the value)";
-    else if (t->isRef() && !t->mut && target->isMutRef() && t->inner == target->inner)
-      hint = " (a shared reference cannot be turned into a mutable one)";
     error(e->loc, "mismatched types: expected '" + target->str() + "', found '" + t->str() + "'" + hint);
     return false;
   }
@@ -1289,6 +1713,12 @@ private:
   Type *check(ExprPtr &e) {
     Type *t = checkInner(e);
     e->type = t;
+    // A variable that refers to another value (a parameter passed without
+    // copying, a loop element, ...) reads as that value.
+    if (t && t->isRef() && e->kind == ExprKind::Ident) {
+      e = wrap(std::move(e), UnOp::Deref, t->inner);
+      return t->inner;
+    }
     return t;
   }
 
@@ -1300,7 +1730,8 @@ private:
     case ExprKind::BoolLit: return tc_.boolTy();
     case ExprKind::NoneLit: return tc_.noneTy();
     case ExprKind::NilLit: return tc_.nilTy();
-    case ExprKind::EnumLit: return e->type;
+    case ExprKind::EnumLit:
+    case ExprKind::FuncRef: return e->type;
     case ExprKind::Ident: {
       auto *id = static_cast<IdentExpr *>(e.get());
       if (id->var) // already resolved (e.g. append rewrite looked at it)
@@ -1310,8 +1741,11 @@ private:
         Type *vt = nullptr;
         if (enumConstructor(e, nullptr, id->name, id->loc, nullptr, vt))
           return vt;
-        if (pkg_->funcs.count(id->name) || kBuiltins.count(id->name))
-          error(id->loc, "function '" + id->name + "' can only be called");
+        auto fi = pkg_->funcs.find(id->name);
+        if (fi != pkg_->funcs.end())
+          return funcValue(e, fi->second);
+        if (kBuiltins.count(id->name))
+          error(id->loc, "builtin function '" + id->name + "' can only be called");
         else if (findImport(id->name))
           error(id->loc, "package '" + id->name + "' can only be used as '" + id->name + ".Name'");
         else
@@ -1333,6 +1767,11 @@ private:
         if (enumConstructor(e, en, fe->name, fe->loc, nullptr, vt))
           return vt;
       if (const Import *imp = importBase(fe->base.get())) {
+        if (imp->pkg) {
+          auto fi = imp->pkg->funcs.find(fe->name);
+          if (fi != imp->pkg->funcs.end())
+            return visible(imp->pkg, fe->name, "function", fe->loc) ? funcValue(e, fi->second) : nullptr;
+        }
         if (EnumInfo *en = qualifiedVariant(*imp, fe->name, fe->loc))
           if (enumConstructor(e, en, fe->name, fe->loc, nullptr, vt))
             return vt;
@@ -1342,6 +1781,12 @@ private:
       if (!bt)
         return nullptr;
       fe->autoDeref = bt->isRef();
+      if (bt->isPtr() && bt->inner->kind == TypeKind::Struct) {
+        if (!requireUnsafe(fe->loc, "reading a field through a C pointer") || !pointeeOk(bt, fe->loc))
+          return nullptr;
+        fe->autoDeref = true;
+        bt = bt->inner;
+      }
       Type *st = bt->derefAll();
       if (st->kind != TypeKind::Struct) {
         error(fe->loc, "type '" + bt->str() + "' has no field '" + fe->name + "'");
@@ -1384,13 +1829,31 @@ private:
         Type *vt = st->inner;
         return tc_.optional(vt->isCopy() ? vt : tc_.ref(vt, false));
       }
-      if (st->kind != TypeKind::Slice) {
+      if (st->isPtr()) {
+        if (!requireUnsafe(ie->loc, "indexing a C pointer") || !pointeeOk(st, ie->loc))
+          return nullptr;
+        if (!it->isInteger()) {
+          error(ie->index->loc, "index must be an integer, found '" + it->str() + "'");
+          return nullptr;
+        }
+        if (it != tc_.intTy() && !coerceIndex(ie->index))
+          return nullptr;
+        return st->inner;
+      }
+      if (st->kind != TypeKind::Slice && st->kind != TypeKind::Array) {
         error(ie->loc, "cannot index a value of type '" + bt->str() + "'");
         return nullptr;
       }
       if (it->kind != TypeKind::Int) {
         error(ie->index->loc, "index must be an int, found '" + it->str() + "'");
         return nullptr;
+      }
+      if (st->kind == TypeKind::Array && ie->index->kind == ExprKind::IntLit) {
+        int64_t i = static_cast<IntLitExpr *>(ie->index.get())->value;
+        if (i < 0 || i >= st->len) {
+          error(ie->index->loc, "index " + std::to_string(i) + " is out of range for '" + st->str() + "'");
+          return nullptr;
+        }
       }
       return st->inner;
     }
@@ -1445,9 +1908,13 @@ private:
           coerce(el, et);
       if (!et)
         return nullptr;
-      if (et->isRef()) {
-        error(sl->loc, "slices cannot hold references");
-        return nullptr;
+      if (sl->arrayLen >= 0) {
+        if ((int64_t)sl->elems.size() > sl->arrayLen) {
+          error(sl->elems[sl->arrayLen]->loc, "too many values for '[" + std::to_string(sl->arrayLen) + "]" +
+                                                  et->str() + "' (the rest of an array starts at zero; it can't grow)");
+          return nullptr;
+        }
+        return tc_.array(et, sl->arrayLen);
       }
       return tc_.slice(et);
     }
@@ -1455,7 +1922,24 @@ private:
     return nullptr;
   }
 
+  // A pointer index of another integer type is converted to int.
+  bool coerceIndex(ExprPtr &idx) {
+    if (isNumericLiteral(idx.get()))
+      return retypeLiteral(idx, tc_.intTy());
+    SourceLoc l = idx->loc;
+    auto call = std::make_unique<CallExpr>(l, std::make_unique<IdentExpr>(l, "int"));
+    call->builtin = Builtin::Convert;
+    call->type = tc_.intTy();
+    call->args.push_back(std::move(idx));
+    idx = std::move(call);
+    return true;
+  }
+
   Type *checkUnary(UnaryExpr &u) {
+    if (u.implicit) // inserted by sema, already checked
+      return u.type;
+    bool addrOk = addrOk_;
+    addrOk_ = false;
     Type *t = check(u.operand);
     if (!t)
       return nullptr;
@@ -1472,32 +1956,43 @@ private:
         return nullptr;
       }
       return t;
-    case UnOp::Deref:
-      if (t->isPtr()) {
-        error(u.loc, "C pointers can't be dereferenced in co; pass them to C functions (and use cstr(p) for C strings)");
+    case UnOp::BitNot:
+      if (!t->isInteger()) {
+        error(u.loc, "'^' (flip bits) needs an integer, found '" + t->str() + "'");
         return nullptr;
       }
+      return t;
+    case UnOp::Deref:
+      if (t->isPtr()) {
+        if (!requireUnsafe(u.loc, "reading or writing through a C pointer") || !pointeeOk(t, u.loc))
+          return nullptr;
+        return t->inner;
+      }
       if (!t->isRef()) {
-        error(u.loc, "cannot dereference '" + t->str() + "' (it is not a reference)");
+        error(u.loc, "cannot dereference '" + t->str() + "' (only C pointers have a '*')");
         return nullptr;
       }
       return t->inner;
     case UnOp::Ref:
     case UnOp::RefMut:
-      if (t->kind == TypeKind::Void) {
-        error(u.loc, "cannot borrow a call that returns nothing");
+      if (!addrOk && unsafeDepth_ == 0) {
+        error(u.loc, "'&' gives C the address of a variable, so it can only be used in calls to C or inside "
+                     "'unsafe { ... }'; co's own functions get their arguments without copying already (write "
+                     "'mut T' on a parameter that changes them)");
         return nullptr;
       }
-      if (t->isRef()) {
-        error(u.loc, "cannot take a reference to a reference ('" + exprStr(u.operand.get()) +
-                         "' is already '" + t->str() + "')");
+      if (t->kind == TypeKind::Void) {
+        error(u.loc, "cannot take the address of a call that returns nothing");
         return nullptr;
       }
       if (u.op == UnOp::RefMut && isPlace(u.operand.get()))
-        checkMutablePlace(u.operand.get(), "borrow as mutable");
-      return tc_.ref(t, u.op == UnOp::RefMut);
+        checkMutablePlace(u.operand.get(), "change");
+      // In a C call `&x` lends x for the call (see externArg); elsewhere it is
+      // a C pointer, which the compiler doesn't track.
+      return addrOk ? tc_.ref(t, u.op == UnOp::RefMut) : tc_.ptr(t);
     case UnOp::ReborrowShared:
     case UnOp::ReborrowMut:
+    case UnOp::Copy:
       return u.type;
     case UnOp::Try: {
       Type *ret = fn_->info->ret;
@@ -1588,6 +2083,23 @@ private:
       b.noneCheck = true; // compares variants only
       return tc_.boolTy();
     }
+    // Shifts: the count may be any integer type; the result has the left side's type.
+    if (b.op == BinOp::Shl || b.op == BinOp::Shr) {
+      const char *name = b.op == BinOp::Shl ? "<<" : ">>";
+      if (!lt->isInteger()) {
+        error(b.loc, std::string("'") + name + "' needs an integer on the left, found '" + lt->str() + "'");
+        return nullptr;
+      }
+      if (!rt->isInteger()) {
+        error(b.rhs->loc, "the shift count must be an integer, found '" + rt->str() + "'");
+        return nullptr;
+      }
+      if (b.rhs->kind == ExprKind::Unary && isNumericLiteral(b.rhs.get())) {
+        error(b.rhs->loc, "the shift count can't be negative");
+        return nullptr;
+      }
+      return lt;
+    }
     // A literal on one side takes the other side's numeric type; nil takes a pointer type.
     if (lt != rt) {
       bool litL = isNumericLiteral(b.lhs.get()), litR = isNumericLiteral(b.rhs.get());
@@ -1595,11 +2107,11 @@ private:
         litL = lt->isInteger();
         litR = !litL;
       }
-      if ((rt->kind == TypeKind::Nil && lt->isPtr()) || (lt->isNumeric() && litR)) {
+      if ((rt->kind == TypeKind::Nil && (lt->isPtr() || lt->isFunc())) || (lt->isNumeric() && litR)) {
         if (!coerce(b.rhs, lt))
           return nullptr;
         rt = lt;
-      } else if ((lt->kind == TypeKind::Nil && rt->isPtr()) || (rt->isNumeric() && litL)) {
+      } else if ((lt->kind == TypeKind::Nil && (rt->isPtr() || rt->isFunc())) || (rt->isNumeric() && litL)) {
         if (!coerce(b.lhs, rt))
           return nullptr;
         lt = rt;
@@ -1607,7 +2119,20 @@ private:
     }
     switch (b.op) {
     case BinOp::OrElse:
+    case BinOp::Shl:
+    case BinOp::Shr:
       return nullptr;
+    case BinOp::BitAnd:
+    case BinOp::BitOr:
+    case BinOp::BitXor:
+    case BinOp::AndNot:
+      if (lt != rt)
+        return mismatch();
+      if (!lt->isInteger()) {
+        error(b.loc, "bitwise operators need integers, found '" + lt->str() + "'");
+        return nullptr;
+      }
+      return lt;
     case BinOp::And:
     case BinOp::Or:
       if (lt->kind != TypeKind::Bool || rt->kind != TypeKind::Bool) {
@@ -1652,7 +2177,7 @@ private:
       if (lt != rt)
         return mismatch();
       bool ordered = b.op != BinOp::Eq && b.op != BinOp::Ne;
-      if (!(lt->isNumeric() || (!ordered && (lt->kind == TypeKind::Bool || lt->isPtr())))) {
+      if (!(lt->isNumeric() || (!ordered && (lt->kind == TypeKind::Bool || lt->isPtr() || lt->isFunc())))) {
         error(b.loc, "cannot compare values of type '" + lt->str() + "'");
         return nullptr;
       }
@@ -1822,18 +2347,30 @@ private:
           return vt;
       }
     }
+    if (namesType(c.callee.get()))
+      return checkPtrConversion(c);
     if (c.callee->kind != ExprKind::Ident) {
-      error(c.loc, "this expression cannot be called");
+      Type *ft = check(c.callee);
+      if (ft && ft->isFunc())
+        return checkIndirectCall(c, ft);
+      if (ft)
+        error(c.loc, "a value of type '" + ft->str() + "' can't be called");
       return nullptr;
     }
     auto *id = static_cast<IdentExpr *>(c.callee.get());
-    if (lookup(id->name)) {
+    if (LocalVar *v = lookup(id->name)) {
+      if (v->type && v->type->derefAll()->isFunc()) {
+        check(c.callee);
+        return checkIndirectCall(c, v->type->derefAll());
+      }
       error(id->loc, "'" + id->name + "' is a variable, not a function");
       return nullptr;
     }
     auto bi = kBuiltins.find(id->name);
     if (bi != kBuiltins.end()) {
       c.builtin = bi->second;
+      if (c.builtin == Builtin::SizeOf)
+        return checkSizeOf(c, self);
       return checkBuiltin(c);
     }
     auto fi = pkg_->funcs.find(id->name);
@@ -1850,6 +2387,145 @@ private:
     }
     checkArgs(c, 0);
     return c.func->ret;
+  }
+
+  // Size and alignment of a C-compatible type, laid out as C does.
+  static std::pair<int64_t, int64_t> cLayout(Type *t) {
+    switch (t->kind) {
+    case TypeKind::Bool: return {1, 1};
+    case TypeKind::Float32: return {4, 4};
+    case TypeKind::IntN: return {t->bits / 8, t->bits / 8};
+    case TypeKind::Array: {
+      auto [es, ea] = cLayout(t->inner);
+      return {es * t->len, ea};
+    }
+    case TypeKind::Struct: {
+      int64_t size = 0, align = 1;
+      for (auto &f : t->st->fields) {
+        auto [fs, fa] = cLayout(f.type);
+        size = (size + fa - 1) / fa * fa + fs;
+        align = std::max(align, fa);
+      }
+      return {(size + align - 1) / align * align, align};
+    }
+    default: return {8, 8}; // int, float, pointers
+    }
+  }
+
+  // A type written where an expression was parsed: `Point`, `geom.Point`, `*byte`.
+  static TypeExprPtr typeFromExpr(const Expr *e) {
+    auto t = std::make_unique<TypeExpr>();
+    t->loc = e->loc;
+    if (e->kind == ExprKind::Ident) {
+      t->name = static_cast<const IdentExpr *>(e)->name;
+    } else if (e->kind == ExprKind::Field && static_cast<const FieldExpr *>(e)->base->kind == ExprKind::Ident) {
+      t->pkg = static_cast<const IdentExpr *>(static_cast<const FieldExpr *>(e)->base.get())->name;
+      t->name = static_cast<const FieldExpr *>(e)->name;
+    } else if (e->kind == ExprKind::Unary && static_cast<const UnaryExpr *>(e)->op == UnOp::Deref) {
+      t->kind = TypeExpr::Ptr;
+      t->inner = typeFromExpr(static_cast<const UnaryExpr *>(e)->operand.get());
+      if (!t->inner)
+        return nullptr;
+    } else {
+      return nullptr;
+    }
+    return t;
+  }
+
+  // `sizeof(T)`: the size in bytes of a type C can use, as a constant.
+  Type *checkSizeOf(CallExpr &c, ExprPtr &self) {
+    Expr *a = c.args.size() == 1 ? c.args[0].get() : nullptr;
+    TypeExprPtr te = a ? typeFromExpr(a) : nullptr;
+    if (!te) {
+      error(c.loc, "sizeof takes the name of one type, like sizeof(int32), sizeof(Point) or sizeof(*byte)");
+      return nullptr;
+    }
+    Type *t = resolveType(*te);
+    if (!t)
+      return nullptr;
+    if (!t->isCCompatible()) {
+      error(a->loc, "sizeof is for types C can use (numbers, bool, pointers and structs of those), not '" +
+                        t->str() + "'");
+      return nullptr;
+    }
+    self = std::make_unique<IntLitExpr>(c.loc, cLayout(t).first);
+    return tc_.intTy();
+  }
+
+  // Does `e`, parsed as an expression, spell a pointer type like `*uint32`?
+  bool namesType(const Expr *e) {
+    if (e->kind != ExprKind::Unary || static_cast<const UnaryExpr *>(e)->op != UnOp::Deref)
+      return false;
+    for (e = static_cast<const UnaryExpr *>(e)->operand.get();
+         e->kind == ExprKind::Unary && static_cast<const UnaryExpr *>(e)->op == UnOp::Deref;)
+      e = static_cast<const UnaryExpr *>(e)->operand.get();
+    if (e->kind == ExprKind::Field) {
+      const Import *imp = importBase(static_cast<const FieldExpr *>(e)->base.get());
+      const std::string &n = static_cast<const FieldExpr *>(e)->name;
+      return imp && imp->pkg && (imp->pkg->structs.count(n) || imp->pkg->enums.count(n));
+    }
+    if (e->kind != ExprKind::Ident)
+      return false;
+    const std::string &n = static_cast<const IdentExpr *>(e)->name;
+    return !lookup(n) && (typeNameTaken(n) || n == "byte" || n == "int64" || n == "float64");
+  }
+
+  // `(*T)(x)`: a pointer from another pointer, or (inside `unsafe`) from an address.
+  Type *checkPtrConversion(CallExpr &c) {
+    TypeExprPtr te = typeFromExpr(c.callee.get());
+    Type *target = te ? resolveType(*te) : nullptr;
+    if (!argCount(c, "a pointer conversion", 1) || !target)
+      return nullptr;
+    Type *t = c.args[0]->type;
+    if (t->isInteger()) {
+      if (!requireUnsafe(c.loc, "making a pointer from a number"))
+        return nullptr;
+    } else if (t->kind == TypeKind::Nil) {
+      c.args[0]->type = target;
+    } else if (!t->isPtr() && !t->isFunc()) {
+      error(c.args[0]->loc, "cannot convert '" + t->str() + "' to '" + target->str() + "'");
+      return nullptr;
+    }
+    c.builtin = Builtin::Convert;
+    return target;
+  }
+
+  // A function named without calling it: a function pointer, which C can call too.
+  Type *funcValue(ExprPtr &e, FuncInfo *f) {
+    std::string why;
+    if (f->name == "main")
+      why = "main can't be used as a value";
+    for (size_t i = 0; i < f->params.size() && why.empty(); i++)
+      if (f->params[i]->isRef() || !cScalar(f->params[i]))
+        why = "its parameter '" + f->paramNames[i] + "' is '" + (f->params[i]->isMutRef() ? "mut " : "") +
+              f->params[i]->derefAll()->str() + "'";
+    if (why.empty() && f->ret->kind != TypeKind::Void && !cScalar(f->ret))
+      why = "it returns '" + f->ret->str() + "'";
+    if (!why.empty()) {
+      error(e->loc, "function '" + f->name + "' can't be used as a value: " + why +
+                        " (function values take and return only numbers, bool, pointers and functions)");
+      return nullptr;
+    }
+    e = std::make_unique<FuncRefExpr>(e->loc, f);
+    return tc_.func(f->params, f->ret);
+  }
+
+  // A call through a function value: `cb(x)`, `s.onClick(e)`.
+  Type *checkIndirectCall(CallExpr &c, Type *ft) {
+    c.indirect = true;
+    for (auto &a : c.args)
+      if (!a->type)
+        check(a);
+    if (c.args.size() != ft->params.size()) {
+      error(c.loc, "this function takes " + std::to_string(ft->params.size()) + " argument" +
+                       (ft->params.size() == 1 ? "" : "s") + ", but " + std::to_string(c.args.size()) +
+                       " were given");
+      return nullptr;
+    }
+    for (size_t i = 0; i < c.args.size(); i++)
+      if (c.args[i]->type)
+        coerce(c.args[i], ft->params[i]);
+    return ft->inner;
   }
 
   // `geom.Dist(p)` or `geom.Circle(1.0)`.
@@ -1904,8 +2580,12 @@ private:
   void checkExternArgs(CallExpr &c) {
     FuncInfo *f = c.func;
     for (auto &a : c.args)
-      if (!a->type)
+      if (!a->type) {
+        addrOk_ = a->kind == ExprKind::Unary &&
+                  (static_cast<UnaryExpr *>(a.get())->op == UnOp::Ref || static_cast<UnaryExpr *>(a.get())->op == UnOp::RefMut);
         check(a);
+        addrOk_ = false;
+      }
     size_t n = f->params.size();
     if (c.args.size() < n || (!f->variadic && c.args.size() != n)) {
       error(c.loc, "'" + f->name + "' expects " + (f->variadic ? "at least " : "") + std::to_string(n) +
@@ -1935,7 +2615,7 @@ private:
       autoRefShared(a);
       return;
     }
-    if (base->kind == TypeKind::Slice && (base->inner == pe || pe->kind == TypeKind::Void)) {
+    if ((base->kind == TypeKind::Slice || base->kind == TypeKind::Array) && (base->inner == pe || pe->kind == TypeKind::Void)) {
       if (!t->isRef())
         autoRefShared(a);
       return;
@@ -1960,7 +2640,7 @@ private:
       a->type = tc_.ptr(tc_.voidTy());
       return;
     }
-    if (!t->isNumeric() && t->kind != TypeKind::Bool && !t->isPtr())
+    if (!cScalar(t))
       error(a->loc, "cannot pass '" + t->str() + "' to a variadic C function; use numbers, bool, pointers or strings");
   }
 
@@ -1978,6 +2658,14 @@ private:
       auto it = st->st->methods.find(fe->name);
       if (it != st->st->methods.end())
         m = it->second;
+    }
+    if (!m && st->kind == TypeKind::Struct) {
+      // A field holding a function: `s.onClick(e)`.
+      auto fi = st->st->fieldIndex.find(fe->name);
+      if (fi != st->st->fieldIndex.end() && st->st->fields[fi->second].type->isFunc()) {
+        Type *ft = check(c.callee);
+        return ft ? checkIndirectCall(c, ft) : nullptr;
+      }
     }
     if (!m) {
       error(fe->loc, "type '" + bt->str() + "' has no method '" + fe->name + "'");
@@ -2011,8 +2699,8 @@ private:
         if (isPlace(recv.get()))
           recv = wrap(std::move(recv), UnOp::ReborrowMut, rt);
       } else {
-        error(fe->loc, "method '" + m->name + "' needs '&mut " + st->str() + "', but '" +
-                           exprStr(recv.get()) + "' is a shared reference '" + bt->str() + "'");
+        error(fe->loc, "method '" + m->name + "' changes its receiver, but '" + exprStr(recv.get()) +
+                           "' is read-only here; copy it first");
       }
     }
     c.args.insert(c.args.begin(), std::move(recv));
@@ -2057,8 +2745,9 @@ private:
       if (!argCount(c, "len", 1))
         return nullptr;
       Type *base = c.args[0]->type->derefAll();
-      if (base->kind != TypeKind::String && base->kind != TypeKind::Slice && base->kind != TypeKind::Map) {
-        error(c.args[0]->loc, "len needs a string, slice or map, found '" + c.args[0]->type->str() + "'");
+      if (base->kind != TypeKind::String && base->kind != TypeKind::Slice && base->kind != TypeKind::Array &&
+          base->kind != TypeKind::Map) {
+        error(c.args[0]->loc, "len needs a string, slice, array or map, found '" + c.args[0]->type->str() + "'");
         return nullptr;
       }
       autoRefShared(c.args[0]);
@@ -2101,8 +2790,11 @@ private:
       // others are converted like any value (int(2.5)).
       if (isNumericLiteral(c.args[0].get()) && (c.args[0]->type->isInteger() || target->isFloat()))
         return coerce(c.args[0], target) ? target : nullptr;
-      if (!c.args[0]->type->isNumeric()) {
-        error(c.args[0]->loc, "cannot convert '" + c.args[0]->type->str() + "' to " + n);
+      Type *from = c.args[0]->type;
+      if ((from->isPtr() || from->isFunc()) && target->isInteger()) // the address, as a number
+        return target;
+      if (!from->isNumeric()) {
+        error(c.args[0]->loc, "cannot convert '" + from->str() + "' to " + n);
         return nullptr;
       }
       return target;
@@ -2125,10 +2817,8 @@ private:
         autoRefShared(c.args[0]);
         return tc_.stringTy(); // the error's message
       }
-      if (c.args[0]->type->isRef()) {
-        error(c.args[0]->loc, "str() needs a value; use '*x'");
-        return nullptr;
-      }
+      if (c.args[0]->type->isRef())
+        coerce(c.args[0], c.args[0]->type->inner);
       if (!c.args[0]->type->isNumeric() && k != TypeKind::Bool) {
         error(c.args[0]->loc, "str() converts numbers, bool or error, found '" + c.args[0]->type->str() + "'");
         return nullptr;
@@ -2183,6 +2873,7 @@ private:
       autoRefShared(c.args[0]);
       return tc_.voidTy();
     }
+    case Builtin::SizeOf: // replaced by a constant in checkSizeOf
     case Builtin::None:
       break;
     }

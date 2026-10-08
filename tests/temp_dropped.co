@@ -1,8 +1,0 @@
-// error: temporary value dropped while still borrowed
-func id(s &string) &string { return s }
-func main() {
-    keep := "k"
-    var r &string = &keep
-    r = id(&"tmp")         // the temporary dies at the end of this statement
-    println(r)
-}

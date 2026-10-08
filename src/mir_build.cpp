@@ -23,7 +23,7 @@ bool isPlaceExpr(const Expr *e) {
 
 class FnBuilder {
 public:
-  FnBuilder(FuncDecl &fd, TypeContext &tc, Diagnostics &diag) : fd_(fd), tc_(tc), diag_(diag) {}
+  FnBuilder(FuncDecl &fd, TypeContext &tc) : fd_(fd), tc_(tc) {}
 
   Function build() {
     FuncInfo *info = fd_.info;
@@ -53,13 +53,13 @@ public:
       assignOkVoid(fd_.body->endLoc); // falling off the end of a `!` function means success
     exitScopes(0, fd_.body->endLoc);
     gotoBlock(returnBB_, fd_.body->endLoc);
+    insertCopies();
     return std::move(f_);
   }
 
 private:
   FuncDecl &fd_;
   TypeContext &tc_;
-  Diagnostics &diag_;
   Function f_;
   int cur_ = 0;
   int returnBB_ = 0;
@@ -72,6 +72,186 @@ private:
   };
   std::vector<Loop> loops_;
   int extendScope_ = -1; // while lowering `x := ...`, `&temporary` lives as long as x's block
+
+  // ----- moves and copies -----
+  //
+  // Assigning or passing a value moves it when the variable it came from is
+  // not used again, and copies it otherwise, so a variable can always be used
+  // after its value was handed on. Liveness decides: a move out of a local
+  // that may still be read afterwards (itself, or through a reference taken
+  // from it, like a switch binding) becomes a move out of a fresh copy.
+
+  struct Uses {
+    std::vector<int> uses, defs;
+  };
+
+  static void placeUses(const Place &p, std::vector<int> &uses) {
+    uses.push_back(p.local);
+    for (auto &pr : p.proj)
+      if (pr.kind == Proj::Index)
+        uses.push_back(pr.indexLocal);
+  }
+
+  static Uses usesOf(const Statement &s) {
+    Uses u;
+    if (s.kind == Statement::StorageDead) {
+      u.defs.push_back(s.local);
+    } else if (s.kind == Statement::Assign) {
+      for (auto &op : s.rv.ops)
+        if (op.kind != Operand::Const)
+          placeUses(op.place, u.uses);
+      if (s.rv.kind == Rvalue::Ref || s.rv.kind == Rvalue::Discriminant)
+        placeUses(s.rv.place, u.uses);
+      if (s.place.isLocal())
+        u.defs.push_back(s.place.local);
+      else
+        placeUses(s.place, u.uses);
+    }
+    // Drops don't count: a moved-out variable is simply not dropped.
+    return u;
+  }
+
+  Uses usesOf(const Terminator &t) const {
+    Uses u;
+    if (t.kind == Terminator::If && t.cond.kind != Operand::Const)
+      placeUses(t.cond.place, u.uses);
+    if (t.kind == Terminator::Return && f_.info->ret->kind != TypeKind::Void)
+      u.uses.push_back(0);
+    return u;
+  }
+
+  static std::vector<int> successors(const BasicBlock &bb) {
+    switch (bb.term.kind) {
+    case Terminator::Goto: return {bb.term.target};
+    case Terminator::If: return {bb.term.thenBB, bb.term.elseBB};
+    default: return {};
+    }
+  }
+
+  void insertCopies() {
+    size_t nb = f_.blocks.size(), nl = f_.locals.size();
+    using Live = std::vector<bool>;
+    auto step = [](Live &live, const Uses &u) {
+      for (int d : u.defs)
+        live[d] = false;
+      for (int x : u.uses)
+        live[x] = true;
+    };
+    std::vector<Live> liveOut(nb, Live(nl, false));
+    auto liveIn = [&](size_t b) {
+      Live live = liveOut[b];
+      step(live, usesOf(f_.blocks[b].term));
+      for (size_t i = f_.blocks[b].stmts.size(); i-- > 0;)
+        step(live, usesOf(f_.blocks[b].stmts[i]));
+      return live;
+    };
+    std::vector<std::vector<int>> preds(nb);
+    for (size_t b = 0; b < nb; b++)
+      for (int s : successors(f_.blocks[b]))
+        preds[s].push_back((int)b);
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (size_t b = nb; b-- > 0;) {
+        Live in = liveIn(b);
+        for (int p : preds[b])
+          for (size_t l = 0; l < nl; l++)
+            if (in[l] && !liveOut[p][l]) {
+              liveOut[p][l] = true;
+              changed = true;
+            }
+      }
+    }
+
+    // The locals each reference-holding local may point into (transitively).
+    // Only locals holding references get a row.
+    std::vector<std::vector<bool>> from(nl);
+    for (size_t l = 0; l < nl; l++)
+      if (f_.locals[l].type->containsRef())
+        from[l].assign(nl, false);
+    for (bool changed = true; changed;) {
+      changed = false;
+      auto add = [&](int dst, int src, bool direct) {
+        if (direct && !from[dst][src])
+          from[dst][src] = changed = true;
+        if (from[src].empty())
+          return;
+        for (size_t l = 0; l < nl; l++)
+          if (from[src][l] && !from[dst][l])
+            from[dst][l] = changed = true;
+      };
+      for (auto &bb : f_.blocks)
+        for (auto &st : bb.stmts) {
+          if (st.kind != Statement::Assign || !st.place.isLocal() || !f_.locals[st.place.local].type->containsRef())
+            continue;
+          int d = st.place.local;
+          if (st.rv.kind == Rvalue::Ref)
+            add(d, st.rv.place.local, true);
+          for (auto &op : st.rv.ops)
+            if (op.kind != Operand::Const && op.type->containsRef())
+              add(d, op.place.local, false);
+        }
+    }
+    auto stillNeeded = [&](const Live &after, int l) {
+      if (after[l])
+        return true;
+      for (size_t r = 0; r < nl; r++)
+        if (after[r] && !from[r].empty() && from[r][l])
+          return true;
+      return false;
+    };
+
+    for (size_t b = 0; b < nb; b++) {
+      BasicBlock &bb = f_.blocks[b];
+      // Which statements move a variable that is used again?
+      Live live = liveOut[b];
+      step(live, usesOf(bb.term));
+      std::vector<std::vector<size_t>> copyOps(bb.stmts.size());
+      for (size_t i = bb.stmts.size(); i-- > 0;) {
+        Statement &s = bb.stmts[i];
+        Uses u = usesOf(s);
+        if (s.kind == Statement::Assign) {
+          Live after = live;
+          for (int d : u.defs)
+            after[d] = false; // the statement's own result is a new value
+          for (size_t oi = 0; oi < s.rv.ops.size(); oi++) {
+            const Operand &op = s.rv.ops[oi];
+            if (op.kind == Operand::Move && op.place.isLocal() && op.place.local != 0 &&
+                stillNeeded(after, op.place.local) && !op.type->containsRef())
+              copyOps[i].push_back(oi);
+          }
+        }
+        step(live, u);
+      }
+      std::vector<Statement> out;
+      for (size_t i = 0; i < bb.stmts.size(); i++) {
+        for (size_t oi : copyOps[i]) {
+          Operand &op = bb.stmts[i].rv.ops[oi];
+          SourceLoc loc = bb.stmts[i].loc;
+          int r = (int)f_.locals.size();
+          f_.locals.push_back({"", tc_.ref(op.type, false), loc});
+          int t = (int)f_.locals.size();
+          f_.locals.push_back({"", op.type, loc});
+          Statement ref;
+          ref.kind = Statement::Assign;
+          ref.place = Place{r, {}};
+          ref.rv.kind = Rvalue::Ref;
+          ref.rv.place = op.place;
+          ref.rv.type = f_.locals[r].type;
+          ref.loc = loc;
+          out.push_back(std::move(ref));
+          Statement cl;
+          cl.kind = Statement::Assign;
+          cl.place = Place{t, {}};
+          cl.rv = builtinCall(BuiltinOp::Clone, op.type, {copyOf(Place{r, {}}, f_.locals[r].type)});
+          cl.loc = loc;
+          out.push_back(std::move(cl));
+          op.place = Place{t, {}};
+        }
+        out.push_back(std::move(bb.stmts[i]));
+      }
+      bb.stmts = std::move(out);
+    }
+  }
 
   // ----- construction helpers -----
 
@@ -175,7 +355,10 @@ private:
     return o;
   }
 
-  // Reads a place as a value: copy for Copy types, otherwise a move.
+  // Reads a place as a value: copy for Copy types, otherwise a move. Values
+  // inside others (fields, elements, through references) are copied, since
+  // taking them would leave a hole; whole variables are moved, and
+  // insertCopies later turns moves of variables still needed into copies.
   Operand useOf(Place p, Type *ty, SourceLoc loc) {
     Operand o;
     o.place = p;
@@ -184,22 +367,20 @@ private:
       o.kind = Operand::Copy;
       return o;
     }
+    if (!p.proj.empty())
+      return cloneOf(std::move(p), ty, loc);
     o.kind = Operand::Move;
-    if (!p.proj.empty()) {
-      bool behindRef = false;
-      for (auto &pr : p.proj)
-        behindRef |= pr.kind == Proj::Deref;
-      std::string name = f_.placeName(p);
-      std::string why;
-      if (behindRef)
-        why = "it is behind a reference";
-      else if (p.proj.back().kind == Proj::Index)
-        why = "it is an element of a slice";
-      else
-        why = "it is a field (moving it would leave the struct partially empty)";
-      diag_.error(loc, "cannot move out of '" + name + "' because " + why + "; borrow it with '&' or use clone(...)");
-      o.kind = Operand::Copy; // avoid cascading errors
-    }
+    return o;
+  }
+
+  // A fresh copy of the value at `p`.
+  Operand cloneOf(Place p, Type *ty, SourceLoc loc) {
+    int t = newTemp(ty, loc);
+    assign(Place{t, {}}, builtinCall(BuiltinOp::Clone, ty, {borrow(std::move(p), ty, false, loc)}), loc);
+    Operand o;
+    o.kind = Operand::Move;
+    o.place.local = t;
+    o.type = ty;
     return o;
   }
 
@@ -244,6 +425,14 @@ private:
       o.type = e->type;
       return o;
     }
+    case ExprKind::FuncRef: {
+      Operand o;
+      o.kind = Operand::Const;
+      o.c.kind = Constant::Func;
+      o.c.fn = static_cast<const FuncRefExpr *>(e)->func;
+      o.type = e->type;
+      return o;
+    }
     default:
       if (isPlaceExpr(e))
         return useOf(lowerPlace(e), e->type, e->loc);
@@ -253,14 +442,12 @@ private:
 
   // Like lowerOperand, but reads of places happen *now* (into a temp), so
   // evaluation order of call arguments matches the source.
-  Operand lowerArg(const Expr *e, const std::string &moveNote = "") {
+  Operand lowerArg(const Expr *e) {
     Operand o = lowerOperand(e);
     if (o.kind == Operand::Const || (o.place.isLocal() && f_.locals[o.place.local].name.empty()))
       return o;
     int t = newTemp(e->type, e->loc);
     assign(Place{t, {}}, use(o), e->loc);
-    if (o.kind == Operand::Move && o.place.isLocal())
-      f_.blocks[cur_].stmts.back().moveNote = moveNote;
     Operand r;
     r.kind = e->type->isCopy() ? Operand::Copy : Operand::Move;
     r.place.local = t;
@@ -505,6 +692,7 @@ private:
     case ExprKind::FloatLit:
     case ExprKind::BoolLit:
     case ExprKind::NilLit:
+    case ExprKind::FuncRef:
       assign(dest, use(lowerOperand(e)), loc);
       return;
     case ExprKind::StrLit: {
@@ -524,7 +712,35 @@ private:
           p.proj.push_back({Proj::Deref});
         Operand m = borrow(p, ie->base->type->derefAll(), false, loc);
         Operand key = lowerArg(ie->index.get());
-        assign(dest, builtinCall(BuiltinOp::MapGet, e->type, {m, key}), loc);
+        if (!ie->ownedRead) {
+          assign(dest, builtinCall(BuiltinOp::MapGet, e->type, {m, key}), loc);
+          return;
+        }
+        // `?V` from the `?&V` lookup: some(copy of the value), or none.
+        Type *vt = e->type->en->optionalOf;
+        Type *found = tc_.optional(tc_.ref(vt, false));
+        int r = newTemp(found, loc);
+        assign(Place{r, {}}, builtinCall(BuiltinOp::MapGet, found, {m, key}), loc);
+        Operand has = isVariant(discriminant(Place{r, {}}, loc), 1, loc);
+        int someBB = newBlock(), noneBB = newBlock(), join = newBlock();
+        branch(has, someBB, noneBB, loc);
+        cur_ = someBB;
+        Place val = Place{r, {}}.withProj({Proj::VariantField, 0, -1, 1}).withProj({Proj::Deref});
+        Rvalue some;
+        some.kind = Rvalue::Aggregate;
+        some.variant = 1;
+        some.type = e->type;
+        some.ops.push_back(useOf(val, vt, loc));
+        assign(dest, std::move(some), loc);
+        gotoBlock(join, loc);
+        cur_ = noneBB;
+        Operand z;
+        z.kind = Operand::Const;
+        z.c.kind = Constant::Zero;
+        z.type = e->type;
+        assign(dest, use(z), loc);
+        gotoBlock(join, loc);
+        cur_ = join;
         return;
       }
       [[fallthrough]];
@@ -559,6 +775,7 @@ private:
         return;
       case UnOp::Neg:
       case UnOp::Not:
+      case UnOp::BitNot:
         rv.kind = Rvalue::UnaryOp;
         rv.uop = u->op;
         rv.ops.push_back(lowerOperand(u->operand.get()));
@@ -584,6 +801,9 @@ private:
         break;
       case UnOp::Try:
         lowerTry(dest, u);
+        return;
+      case UnOp::Copy:
+        assign(dest, use(cloneOf(lowerPlace(u->operand.get()), e->type, loc)), loc);
         return;
       }
       assign(dest, std::move(rv), loc);
@@ -682,6 +902,22 @@ private:
     }
     case ExprKind::SliceLit: {
       auto *sl = static_cast<const SliceLitExpr *>(e);
+      if (sl->arrayLen >= 0) { // [N]T{...}: the given elements, then zeros
+        Rvalue rv;
+        rv.kind = Rvalue::Aggregate;
+        rv.type = e->type;
+        for (auto &el : sl->elems)
+          rv.ops.push_back(lowerArg(el.get()));
+        while ((int64_t)rv.ops.size() < sl->arrayLen) {
+          Operand z;
+          z.kind = Operand::Const;
+          z.c.kind = Constant::Zero;
+          z.type = e->type->inner;
+          rv.ops.push_back(z);
+        }
+        assign(dest, std::move(rv), loc);
+        return;
+      }
       Rvalue rv;
       rv.kind = Rvalue::SliceLit;
       rv.type = e->type;
@@ -710,6 +946,7 @@ private:
       case Builtin::Panic: rv.builtin = BuiltinOp::Panic; break;
       case Builtin::MakeError: rv.builtin = BuiltinOp::MakeError; break;
       case Builtin::Delete: rv.builtin = BuiltinOp::MapDelete; break;
+      case Builtin::SizeOf: // a constant by now
       case Builtin::None: break;
       }
       for (auto &a : c->args)
@@ -717,27 +954,26 @@ private:
       return rv;
     }
     rv.kind = Rvalue::Call;
+    if (c->indirect) {
+      rv.ops.push_back(lowerArg(c->callee.get()));
+      for (auto &a : c->args)
+        rv.ops.push_back(lowerArg(a.get()));
+      return rv;
+    }
     rv.func = c->func;
     rv.ops.resize(c->args.size());
+    // Arguments a function may change are lent last, so the others can still
+    // read them first: `push(v, len(v))`, `v.add(v[0])`.
     size_t first = c->receiverLast ? 1 : 0;
-    auto note = [&](size_t i) {
-      if (i >= c->func->params.size()) // variadic C arguments
-        return std::string();
-      Type *t = c->func->params[i];
-      if (t->isCopy() || c->args[i]->kind != ExprKind::Ident)
-        return std::string();
-      std::string var = static_cast<const IdentExpr *>(c->args[i].get())->name;
-      if (c->receiverLast && i == 0)
-        return "'" + var + "' is moved here because method '" + c->func->name +
-               "' takes its receiver by value; declare it as '(" + c->func->paramNames[0] + " &" + t->str() +
-               ")' to only lend it";
-      return "'" + var + "' is moved into '" + c->func->name + "' here; to only lend it, declare parameter '" +
-             c->func->paramNames[i] + "' as '&" + t->str() + "'";
-    };
+    auto changes = [&](size_t i) { return i < c->func->params.size() && c->func->params[i]->isMutRef(); };
     for (size_t i = first; i < c->args.size(); i++)
-      rv.ops[i] = lowerArg(c->args[i].get(), note(i));
+      if (!changes(i))
+        rv.ops[i] = lowerArg(c->args[i].get());
     if (c->receiverLast)
-      rv.ops[0] = lowerArg(c->args[0].get(), note(0));
+      rv.ops[0] = lowerArg(c->args[0].get());
+    for (size_t i = first; i < c->args.size(); i++)
+      if (changes(i))
+        rv.ops[i] = lowerArg(c->args[i].get());
     return rv;
   }
 
@@ -928,6 +1164,12 @@ private:
     case AssignOp::Sub: rv.bop = BinOp::Sub; break;
     case AssignOp::Mul: rv.bop = BinOp::Mul; break;
     case AssignOp::Div: rv.bop = BinOp::Div; break;
+    case AssignOp::BitAnd: rv.bop = BinOp::BitAnd; break;
+    case AssignOp::BitOr: rv.bop = BinOp::BitOr; break;
+    case AssignOp::BitXor: rv.bop = BinOp::BitXor; break;
+    case AssignOp::AndNot: rv.bop = BinOp::AndNot; break;
+    case AssignOp::Shl: rv.bop = BinOp::Shl; break;
+    case AssignOp::Shr: rv.bop = BinOp::Shr; break;
     default: rv.bop = BinOp::Rem; break;
     }
     rv.ops.push_back(copyOf(p, lt));
@@ -1194,12 +1436,12 @@ private:
 
 } // namespace
 
-mir::Module buildMir(Program &prog, TypeContext &tc, Diagnostics &diag) {
+mir::Module buildMir(Program &prog, TypeContext &tc) {
   mir::Module m;
   for (auto &fd : prog.funcs) {
     if (!fd->info || fd->isExtern)
       continue;
-    FnBuilder b(*fd, tc, diag);
+    FnBuilder b(*fd, tc);
     m.funcs.push_back(b.build());
   }
   return m;

@@ -1,10 +1,18 @@
+// expect: 2 1
 // expect: 11 22
 type P struct { a, b int }
+func swap(x mut int, y mut int) {
+    t := x
+    x = y
+    y = t
+}
+func add(x mut int, k int) { x += k }
 func main() {
     p := P{a: 1, b: 2}
-    x := &mut p.a
-    y := &mut p.b     // different fields: no conflict
-    *x += 10
-    *y += 20
+    swap(p.a, p.b)     // different fields: both can be changed at once
     println(p.a, p.b)
+    q := P{a: 1, b: 2}
+    add(q.a, 10)
+    add(q.b, q.a + 9)
+    println(q.a, q.b)
 }

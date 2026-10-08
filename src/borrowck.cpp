@@ -1,6 +1,8 @@
 #include "borrowck.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <tuple>
 #include <set>
 #include <unordered_map>
 
@@ -55,17 +57,24 @@ class Checker {
 public:
   Checker(const Function &f, Diagnostics &diag) : f_(f), diag_(diag) {}
 
-  void run() {
+  struct DistinctCheck {
+    int block, stmt; // insert before this statement
+    int a, b;        // index locals
+  };
+
+  std::vector<DistinctCheck> run() {
     layout();
     checkInit();
     computeLiveness();
     collectLoansAndRegions();
     solveRegions();
     checkLoans();
+    return std::move(distinct_);
   }
 
 private:
   const Function &f_;
+  std::vector<DistinctCheck> distinct_;
   Diagnostics &diag_;
   std::vector<int> base_; // first point of each block
   int numPoints_ = 0;
@@ -134,6 +143,7 @@ private:
       out.push_back({Access::StorageDead, Place{s.local, {}}, s.loc});
       break;
     case Statement::Nop:
+    case Statement::CheckDistinct:
       break;
     }
     return out;
@@ -200,8 +210,6 @@ private:
           msg = "cannot assign to part of moved value '" + vname + "'";
         else
           msg = "borrow of moved value '" + vname + "'";
-        if (!l.type->isCopy() && !l.type->isRef())
-          msg += " (type '" + l.type->str() + "' is not copyable; use clone(...) or a reference)";
         diag_.error(a.loc, msg, notes);
       };
       const BasicBlock &bb = f_.blocks[b];
@@ -224,7 +232,7 @@ private:
           if (a.kind == Access::Move && consumesLocal(a.place)) {
             st.set(a.place.local);
             if (report)
-              movedAt[a.place.local] = {a.loc, s.moveNote.empty() ? "value moved here" : s.moveNote};
+              movedAt[a.place.local] = {a.loc, "value moved here"};
           } else if (a.kind == Access::Drop || a.kind == Access::StorageDead) {
             st.set(a.place.local);
           }
@@ -434,39 +442,64 @@ private:
     }
   }
 
+  // In co, the borrows that can conflict come from passing a variable to a
+  // parameter (`mut` or not), and from loops and switches looking at it.
   void report(const Loan &l, const Access &a) {
     std::string p = name(a.place);
     std::string lp = name(l.place);
     std::string msg;
-    std::string noteMsg = std::string(l.mut ? "mutable" : "immutable") + " borrow of '" + lp + "' occurs here";
+    std::string noteMsg = l.mut ? "'" + lp + "' is passed here to be changed" : "'" + lp + "' is in use here";
     switch (a.kind) {
     case Access::Read:
-      msg = "cannot use '" + p + "' because it is mutably borrowed";
+    case Access::SharedBorrow:
+      msg = "cannot use '" + p + "' while it is being changed";
       break;
     case Access::Move:
-      msg = "cannot move out of '" + p + "' because it is borrowed";
-      break;
-    case Access::SharedBorrow:
-      msg = "cannot borrow '" + p + "' as immutable because it is also borrowed as mutable";
+      msg = "cannot hand on '" + p + "' while it is in use";
       break;
     case Access::MutBorrow:
-      msg = l.mut ? "cannot borrow '" + p + "' as mutable more than once at a time"
-                  : "cannot borrow '" + p + "' as mutable because it is also borrowed as immutable";
+      msg = l.mut ? "'" + p + "' is passed to be changed twice at once"
+                  : "cannot change '" + p + "' while it is also in use";
       break;
     case Access::Write:
     case Access::ShallowWrite:
-      msg = "cannot assign to '" + p + "' because it is borrowed";
+      msg = "cannot assign to '" + p + "' while it is in use";
       break;
     case Access::Drop:
     case Access::StorageDead:
       if (f_.locals[a.place.local].name.empty())
-        msg = "temporary value dropped while still borrowed";
+        msg = "temporary value dropped while still in use";
       else
-        msg = "'" + p + "' does not live long enough (it is dropped here while still borrowed)";
-      noteMsg = "'" + lp + "' is borrowed here, and the borrow is used later";
+        msg = "'" + p + "' does not live long enough (it is dropped here while still in use)";
+      noteMsg = "'" + lp + "' is used here, and later";
       break;
     }
     diag_.error(a.loc, msg, {{l.loc, noteMsg}});
+  }
+
+  // Do `a` and `b` name elements of the same slice at different index
+  // locals, and otherwise the same path? Then they're disjoint if the indices
+  // differ; the index locals are returned.
+  static bool differOnlyByIndex(const Place &a, const Place &b, int &ia, int &ib) {
+    if (a.local != b.local || a.proj.size() != b.proj.size())
+      return false;
+    int found = 0;
+    for (size_t i = 0; i < a.proj.size(); i++) {
+      const Proj &x = a.proj[i], &y = b.proj[i];
+      if (x.kind != y.kind)
+        return false;
+      if (x.kind == Proj::Index) {
+        if (x.indexLocal != y.indexLocal) {
+          if (found++)
+            return false;
+          ia = x.indexLocal;
+          ib = y.indexLocal;
+        }
+      } else if (x.field != y.field || x.variant != y.variant) {
+        return false;
+      }
+    }
+    return found == 1;
   }
 
   void checkLoans() {
@@ -482,7 +515,7 @@ private:
           if (st.test(l) && !regions_[loans_[l].region].test(p))
             st.reset(l);
       };
-      auto checkAccesses = [&](const std::vector<Access> &acc, int p) {
+      auto checkAccesses = [&](const std::vector<Access> &acc, int p, int stmt) {
         if (!doReport)
           return;
         for (auto &a : acc) {
@@ -495,6 +528,11 @@ private:
             if (atNext && !regions_[loans_[l].region].test(p + 1))
               continue;
             if (conflicts(loans_[l], a)) {
+              int ia, ib;
+              if (stmt >= 0 && differOnlyByIndex(loans_[l].place, a.place, ia, ib)) {
+                distinct_.push_back({b, stmt, ia, ib});
+                continue;
+              }
               report(loans_[l], a);
               break;
             }
@@ -505,7 +543,7 @@ private:
         int p = point(b, (int)i);
         filter(p);
         const Statement &s = bb.stmts[i];
-        checkAccesses(accessesOf(s), p);
+        checkAccesses(accessesOf(s), p, (int)i);
         // kills
         if (s.kind == Statement::Assign && s.place.isLocal()) {
           for (size_t l = 0; l < nloans; l++)
@@ -522,7 +560,7 @@ private:
       }
       int tp = point(b, (int)bb.stmts.size());
       filter(tp);
-      checkAccesses(accessesOf(bb.term, nonVoidReturn()), tp);
+      checkAccesses(accessesOf(bb.term, nonVoidReturn()), tp, -1);
       return st;
     };
 
@@ -542,9 +580,23 @@ private:
 
 } // namespace
 
-void borrowCheck(const mir::Function &f, Diagnostics &diag) {
+void borrowCheck(mir::Function &f, Diagnostics &diag) {
   Checker c(f, diag);
-  c.run();
+  auto checks = c.run();
+  // Insert from the back so earlier positions stay valid.
+  auto key = [](auto &x) { return std::make_tuple(x.block, x.stmt, x.a, x.b); };
+  std::sort(checks.begin(), checks.end(), [&](auto &x, auto &y) { return key(x) > key(y); });
+  checks.erase(std::unique(checks.begin(), checks.end(), [&](auto &x, auto &y) { return key(x) == key(y); }),
+               checks.end());
+  for (auto &dc : checks) {
+    auto &stmts = f.blocks[dc.block].stmts;
+    Statement s;
+    s.kind = Statement::CheckDistinct;
+    s.local = dc.a;
+    s.local2 = dc.b;
+    s.loc = stmts[dc.stmt].loc;
+    stmts.insert(stmts.begin() + dc.stmt, std::move(s));
+  }
 }
 
 } // namespace co

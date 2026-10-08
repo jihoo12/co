@@ -1,7 +1,7 @@
 // exit: 1
 // expect: step 1
 // stderr: error: config missing: settings.txt
-func readConfig(path &string) !string {
+func readConfig(path string) !string {
     return error("config missing: " + path)
 }
 func main() ! {

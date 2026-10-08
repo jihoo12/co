@@ -3,17 +3,17 @@
 // expect: 1
 type V struct { x, y int }
 func (v V) sum() int { return v.x + v.y }
-func (v &mut V) scale(k int) { v.x *= k; v.y *= k }
-func (v &V) copyOut() V { return *v }
+func (v mut V) scale(k int) { v.x *= k; v.y *= k }
+func (v V) copyOut() V { return v }
 type Counter struct { hits []int }
-func (c &mut Counter) hit() { c.hits = append(c.hits, 1) }
-func (c &Counter) count() int { return len(c.hits) }
+func (c mut Counter) hit() { c.hits = append(c.hits, 1) }
+func (c Counter) count() int { return len(c.hits) }
 func main() {
     v := V{x: 3, y: 4}
     println(v.sum())
     w := V{x: 1, y: 2}
     w.scale(10)
-    r := &w
+    r := w
     c := r.copyOut()
     println(c.x, c.y)
     var ctr Counter

@@ -1,7 +1,0 @@
-// error: pass it as '&mut c' to allow that
-type C struct { n int }
-func bump(c &mut C) { c.n++ }
-func main() {
-    c := C{}
-    bump(c)
-}

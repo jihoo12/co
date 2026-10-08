@@ -1,0 +1,10 @@
+// error: index 3 is out of range for '[3]int'
+// error: too many values for '[2]int'
+// error: append needs a slice, found '[2]int'
+func main() {
+    a := [3]int{}
+    println(a[3])
+    b := [2]int{1, 2, 3}
+    c := [2]int{}
+    c = append(c, 1)
+}

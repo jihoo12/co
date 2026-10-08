@@ -8,5 +8,5 @@ type private struct { X int }
 func Public() int { return helper() }
 func helper() int { return 1 }
 
-func (s &Secret) Peek() int { return s.hidden }
-func (s &Secret) peek() int { return s.hidden }
+func (s Secret) Peek() int { return s.hidden }
+func (s Secret) peek() int { return s.hidden }

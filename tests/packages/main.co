@@ -22,7 +22,7 @@ type Pair struct {
     a, b geom.Point
 }
 
-func describe(sh &geom.Shape) string {
+func describe(sh geom.Shape) string {
     out := ""
     switch sh {
     case geom.Circle(r): out = "circle " + str(r)

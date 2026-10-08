@@ -37,10 +37,11 @@ struct Place {
 };
 
 struct Constant {
-  enum Kind { Int, Float, Bool, Zero } kind = Int;
+  enum Kind { Int, Float, Bool, Zero, Func } kind = Int;
   int64_t i = 0;
   double f = 0;
   bool b = false;
+  FuncInfo *fn = nullptr; // Func: a pointer to this function
 };
 
 struct Operand {
@@ -84,20 +85,23 @@ struct Rvalue {
   Place place;       // Ref, Discriminant
   int variant = -1;  // Aggregate of an enum variant
   std::vector<Operand> ops;
-  FuncInfo *func = nullptr; // Call
+  FuncInfo *func = nullptr; // Call; null for a call through a function value, which is then ops[0]
   BuiltinOp builtin = BuiltinOp::Print;
   BinOp cmp = BinOp::Eq;    // StrCmp
   std::string strLit;       // StrLit
   Type *type = nullptr;     // result type
 };
 
+// CheckDistinct stops the program if locals `local` and `local2` (two
+// indices into the same slice) are equal: the borrow checker inserts it when
+// two elements are used at once, like `swap(v[i], v[j])`.
 struct Statement {
-  enum Kind { Assign, Drop, StorageDead, Nop } kind = Nop;
+  enum Kind { Assign, Drop, StorageDead, Nop, CheckDistinct } kind = Nop;
   Place place; // Assign: destination; Drop: dropped place
   Rvalue rv;
-  int local = -1; // StorageDead
+  int local = -1;  // StorageDead, CheckDistinct
+  int local2 = -1; // CheckDistinct
   SourceLoc loc;
-  std::string moveNote; // explains a move into a function argument
 };
 
 struct Terminator {

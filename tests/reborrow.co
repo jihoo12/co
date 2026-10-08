@@ -1,11 +1,11 @@
 // expect: 3
-func inc(x &mut int) { *x += 1 }
-func incTwice(x &mut int) {
-    inc(x)        // implicit reborrow: x is still usable
+func inc(x mut int) { x += 1 }
+func incTwice(x mut int) {
+    inc(x)        // passes the caller's variable on
     inc(x)
 }
 func main() {
     n := 1
-    incTwice(&mut n)
+    incTwice(n)
     println(n)
 }
